@@ -1,0 +1,146 @@
+import { Theme } from "theme.slint";
+import { IconButton } from "widgets.slint";
+
+export struct TabInfo {
+    id: string,
+    title: string,
+    kind: string,   // "welcome" | "terminal"
+    connected: bool,
+}
+
+// --- SingleTab -------------------------------------------------------------
+component SingleTab inherits Rectangle {
+    in property <TabInfo> info;
+    in property <bool> active;
+    callback selected();
+    callback closed();
+
+    height: 30px;
+    min-width: 100px;          // 缩短：原 120px，短名称（如 "pve"）时更紧凑
+    max-width: 160px;          // 新增：防止长名称把 tab 撑得过宽
+    horizontal-stretch: 0;    // 新增：不参与 TabBar 的等分拉伸，保持自然宽度
+    border-radius: Theme.radius-sm;
+    background: active ? Theme.bg-panel
+        : (touch.has-hover ? Theme.bg-hover : transparent);
+    animate background { duration: 120ms; }
+
+    // Declared FIRST so the HorizontalLayout's children (close button) are at
+    // a higher z-order and receive their own click events.
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.selected(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 6px;
+        spacing: 8px;
+        alignment: start;
+
+        // Status indicator
+        Rectangle {
+            width: 8px; height: 8px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 4px;
+            background: info.kind == "welcome" ? Theme.text-muted
+                : (info.connected ? Theme.success : Theme.warning);
+        }
+
+        Text {
+            text: info.title;
+            color: active ? Theme.text-primary : Theme.text-secondary;
+            font-size: Theme.fs-sm;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        // Only show close button for non-welcome tabs
+        if info.kind != "welcome" : IconButton {
+            glyph: "×";
+            size: 20px;
+            y: (parent.height - self.height) / 2;
+            clicked => { root.closed(); }
+        }
+    }
+}
+
+// --- TabBar ----------------------------------------------------------------
+export component TabBar inherits Rectangle {
+    in property <[TabInfo]> tabs;
+    in property <string> active-id;
+    // Keep this much clear on the right so tabs don't slide under the app's
+    // top-right toolbar icons, which are positioned over the tab row (#122).
+    in property <length> reserve-right: 0px;
+    callback tab-selected(string);
+    callback tab-closed(string);
+    callback new-tab();
+
+    height: 36px;
+    background: Theme.bg-panel-alt;
+
+    // True only when the tabs are wider than the available strip width (#122).
+    // Computed from the TabBar's own width (set by the parent) — NOT flick.width —
+    // so showing the arrows (which shrink the flickable) can't feed back into this
+    // condition and form a binding loop. The 64px allows for the two arrows.
+    property <bool> tab-overflow:
+        strip.preferred-width > root.width - root.reserve-right - 64px;
+
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+
+        // Horizontally-scrollable strip: when the tabs overflow the available
+        // width they stay reachable by the arrows or by dragging / trackpad (#122).
+        flick := Flickable {
+            horizontal-stretch: 1;
+            viewport-height: self.height;
+            viewport-width: max(self.width, strip.preferred-width);
+            strip := HorizontalLayout {
+                spacing: 2px;
+                alignment: start;
+                for tab[i] in tabs : SingleTab {
+                    info: tab;
+                    active: tab.id == root.active-id;
+                    selected => { root.tab-selected(tab.id); }
+                    closed => { root.tab-closed(tab.id); }
+                }
+                IconButton {
+                    glyph: "+";
+                    size: 28px;
+                    y: (parent.height - self.height) / 2;
+                    clicked => { root.new-tab(); }
+                }
+            }
+        }
+
+        // Reserved gap for the external top-right toolbar icons (#122).
+        Rectangle { width: root.reserve-right; }
+    }
+
+    // Scroll arrows — absolute overlays (NOT layout items) so toggling them can't
+    // change the layout that `tab-overflow` reads (avoids a binding loop). Shown
+    // only on overflow, masking the edge tab beneath them (#122).
+    if root.tab-overflow : Rectangle {
+        x: 3px;
+        y: (parent.height - self.height) / 2;
+        width: 26px; height: 26px;
+        background: Theme.bg-panel-alt;
+        IconButton {
+            glyph: "‹"; size: 24px;
+            clicked => { flick.viewport-x = min(0px, flick.viewport-x + 120px); }
+        }
+    }
+    if root.tab-overflow : Rectangle {
+        x: root.width - root.reserve-right - 29px;
+        y: (parent.height - self.height) / 2;
+        width: 26px; height: 26px;
+        background: Theme.bg-panel-alt;
+        IconButton {
+            glyph: "›"; size: 24px;
+            clicked => {
+                flick.viewport-x = max(flick.width - flick.viewport-width, flick.viewport-x - 120px);
+            }
+        }
+    }
+}
