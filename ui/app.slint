@@ -810,7 +810,11 @@ export component AppWindow inherits Window {
         icon: "\u{E8B8}";
         tooltip: root.lang-en ? "Settings" : "设置";
         active: root.settings-open;
-        clicked => { root.settings-open = !root.settings-open; root.download-open = false; }
+        clicked => {
+            root.settings-open = !root.settings-open;
+            root.ssh-import-hint = "";
+            root.download-open = false;
+        }
     }
     IconBtn {
         x: root.width - 64px; y: root.custom-titlebar ? 46px : 8px;
@@ -1471,7 +1475,7 @@ export component AppWindow inherits Window {
         x: parent.width - 196px;
         y: root.custom-titlebar ? 78px : 40px;
         width: 198px;
-        height: 220px;
+        height: root.ssh-import-hint == "" ? 220px : 244px;
         visible: root.settings-open;
         background: Theme.bg-panel;
         border-radius: Theme.radius-md;
@@ -1559,7 +1563,6 @@ export component AppWindow inherits Window {
                 import-ta := TouchArea {
                     mouse-cursor: pointer;
                     clicked => {
-                        root.settings-open = false;
                         root.import-ssh-config();
                     }
                 }
@@ -1571,6 +1574,15 @@ export component AppWindow inherits Window {
                     Text { text: @tr("Import ~/.ssh/config"); color: Theme.text-primary; font-size: Theme.fs-md;
                            vertical-alignment: center; horizontal-stretch: 1; }
                 }
+            }
+            if root.ssh-import-hint != "" : Text {
+                text: root.ssh-import-hint;
+                color: Theme.text-muted;
+                font-size: Theme.fs-xs;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                height: 20px;
+                overflow: elide;
             }
             // Language toggle: shows the language you'll switch TO.
             Rectangle {
