@@ -1,141 +1,132 @@
-# cloudshell
+# Cloudshell
 
 [简体中文](./README.md) | **English**
 
-A lightweight, low-memory SSH / terminal client inspired by FinalShell, but
-written entirely in **Rust + [Slint](https://slint.dev)**. The goal is to keep
-FinalShell's core experience (resource-monitor sidebar, session management,
-tabbed terminals) while cutting memory use from the 400 MB+ of a JVM app down to
-the tens-of-MB range of a native binary.
+> A lightweight, native SSH and terminal client for everyday remote work.
 
-## Screenshots
+Cloudshell is built with Rust and [Slint](https://slint.dev). It brings tabbed terminals, file transfer, port forwarding, and local/remote monitoring into one workspace, without the memory footprint typical of JVM-based clients.
 
-<p align="center">
-  <img src="docs/screenshots/01-welcome-en.png" alt="Welcome / session management" width="800"><br>
-  <em>Welcome page: session management + local resource monitor sidebar</em>
-</p>
+## Why Cloudshell
 
-<p align="center">
-  <img src="docs/screenshots/02-terminal-btop.png" alt="Terminal + SFTP" width="800"><br>
-  <em>Tabbed terminal (full-screen btop) + SFTP file browser + remote resource monitoring</em>
-</p>
+- **Native and lightweight** — a Rust binary with no garbage collector, designed for keeping several connections open.
+- **One remote-work workspace** — terminal, SFTP, resource panels, and session management stay together.
+- **Works with your SSH setup** — password, private-key, encrypted-key, and `~/.ssh/config` workflows are supported.
+- **Cross-platform** — builds are available for Windows, Linux, and macOS.
 
-## Download & install
+## Highlights
 
-Every `v*` tag triggers a GitHub Actions build that produces native binaries for
-**Windows / Linux / macOS**, published on the
-[Releases](https://github.com/jeff141/cloudshell/releases) page.
+| Area | What it provides |
+| --- | --- |
+| SSH & terminal | VT/ANSI terminal emulation, full-screen programs such as `vim`, `htop`, and `btop`, and multiple tabs. |
+| Session management | Create, edit, delete, group, duplicate, import, and export connections. |
+| SFTP & transfer | Browse remote files, upload/download, drag-and-drop transfer, and in-terminal ZMODEM (`sz`) receive. |
+| Monitoring | Local and remote CPU, memory, swap, network, disk, process, and system information. |
+| Connectivity | SSH password/private-key authentication, serial and Telnet sessions, SOCKS5/HTTP outbound proxies. |
+| Tunnels | Local (`-L`), remote (`-R`), and dynamic SOCKS5 (`-D`) forwarding. |
+| Productivity | Quick commands, command history, and synchronized input to all online sessions. |
+| Security | First-use host-key confirmation, changed-key warnings, and ChaCha20-Poly1305 encrypted saved passwords. |
+
+## Install
+
+Download the package for your platform from [Releases](https://github.com/jeff141/cloudshell/releases). Every `v*` tag triggers automated Windows, Linux, and macOS builds.
 
 ### Windows
 
-Download `cloudshell-*-windows-x86_64.zip`, unzip, and run `cloudshell.exe`.
+Download `cloudshell-*-windows-x86_64.zip`, extract it, then run `cloudshell.exe`.
 
 ### Linux
 
 ```bash
 tar -xzf cloudshell-*-linux-x86_64.tar.gz
 cd cloudshell-*-linux-x86_64
-./cloudshell                                  # run it directly
-# Optional: install the app icon + launcher entry (shows the icon in the dock /
-# app list — no argument needed, it finds the binary next to the script)
+./cloudshell
+
+# Optional: install the launcher and Dock icon
 chmod +x install-linux.sh && ./install-linux.sh
 ```
 
-> Requires glibc ≥ 2.35 (Ubuntu 22.04+ / Debian 12+). On Wayland you may need to
-> log out/in once after installing the icon.
+glibc 2.35 or later is required (for example, Ubuntu 22.04+ or Debian 12+). On Wayland, logging out and back in may be necessary after icon installation.
 
 ### macOS
 
 ```bash
-tar -xzf cloudshell-*-macos-*.tar.gz          # aarch64 = Apple Silicon, x86_64 = Intel
-xattr -dr com.apple.quarantine cloudshell     # clear the "unsigned app" Gatekeeper flag
+tar -xzf cloudshell-*-macos-*.tar.gz
+xattr -dr com.apple.quarantine cloudshell
 ./cloudshell
 ```
 
-> To build from source, see [Running](#running) below.
+Use the `aarch64` build for Apple silicon and `x86_64` for Intel Macs. The command above clears the quarantine attribute for unsigned builds.
 
-## Features
+## Quick start
 
-### Done
+1. Launch Cloudshell and choose **New Session** in the upper right.
+2. Enter the host, port, and user, then select password or private-key authentication.
+3. Save and connect. On the first connection, verify and accept the host-key fingerprint.
+4. Use the bottom panel for SFTP, the sidebar for resources, and the toolbar for tunnels, quick commands, and synchronized input.
 
-- [x] FinalShell-style UI with dark / light / follow-system themes
-- [x] Local + remote resource monitoring (CPU / memory / swap / network / disk)
-- [x] Remote process monitor (read-only table sorted by CPU)
-- [x] Full VT/ANSI terminal emulation (btop / htop / vim render correctly)
-- [x] Tabs (welcome page + multiple sessions)
-- [x] Session management: create / edit / delete / groups, local JSON, export / import
-  - Config location: `%APPDATA%/cloudshell/sessions.json` (Windows)
-    / `~/.config/cloudshell/sessions.json` (Linux)
-    / `~/Library/Application Support/cloudshell/sessions.json` (macOS)
-- [x] SSH (`russh`, pure Rust): password / private key / encrypted key (passphrase)
-- [x] SFTP browser + upload / download (drag-and-drop) + in-terminal ZMODEM (`sz`) receive
-- [x] SSH port forwarding / tunnels: local -L / remote -R / dynamic -D (SOCKS5)
-- [x] Quick commands + command box (broadcast to all sessions) + command history
-- [x] Serial / Telnet sessions
-- [x] Outbound proxy (SOCKS5 / HTTP)
-- [x] Import `~/.ssh/config`
-- [x] Session passwords encrypted at rest (ChaCha20-Poly1305)
+Sessions are stored locally:
 
-### Planned
+- Windows: `%APPDATA%/cloudshell/sessions.json`
+- Linux: `~/.config/cloudshell/sessions.json`
+- macOS: `~/Library/Application Support/cloudshell/sessions.json`
 
-- [ ] Known-hosts (`known_hosts`) verification
-- [ ] Store session passwords in the OS keychain
-- [ ] Split panes for tabbed terminals
+## Import an OpenSSH configuration
 
-## Tech stack
+If you already use OpenSSH, choose **Import `~/.ssh/config`** from Settings. Each concrete `Host` entry becomes a Cloudshell session, using the following fields:
 
-| Module        | Choice                                                            |
-| ------------- | ----------------------------------------------------------------- |
-| UI            | [Slint](https://slint.dev) (compiled pure Rust, no GC)            |
-| Async runtime | [`tokio`](https://tokio.rs)                                       |
-| SSH protocol  | [`russh`](https://crates.io/crates/russh) (no libssh dependency)  |
-| System metrics| [`sysinfo`](https://crates.io/crates/sysinfo)                     |
-| Serialization | `serde` + `serde_json`                                            |
-| Logging       | `tracing` + `tracing-subscriber`                                  |
+```sshconfig
+Host production
+  HostName 10.0.0.5
+  User deploy
+  Port 2222
+  IdentityFile ~/.ssh/id_ed25519
+```
 
-## Running
+- Supported: `Host`, `HostName`, `User`, `Port`, and `IdentityFile`.
+- Wildcard rules such as `Host *`, along with unsupported OpenSSH directives, are not imported.
+- Existing aliases and entries with the same host + user are skipped. A missing user defaults to `root`.
+- Importing only creates or supplements Cloudshell sessions; it never changes `~/.ssh/config`.
+
+## Run from source
+
+Requires Rust 1.75 or later and the GUI build dependencies for your platform.
 
 ```bash
 cargo run --release
 ```
 
-On first launch an empty session store is created at
-`%APPDATA%/cloudshell/sessions.json`. Click **"＋ New Session"** in the top-right
-to add your first server.
+Useful development checks:
 
-## Project layout
-
+```bash
+cargo check
+cargo test
 ```
+
+## Repository layout
+
+```text
 cloudshell/
-├── Cargo.toml
-├── build.rs                 # Slint compiler entry point
-├── ui/
-│   ├── app.slint            # top-level window
-│   ├── theme.slint          # design tokens
-│   ├── widgets.slint        # reusable buttons / inputs / sparkline
-│   ├── sidebar.slint        # left-hand system monitor panel
-│   ├── tabs.slint           # top tab bar
-│   ├── welcome.slint        # welcome page / quick connect
-│   ├── session_dialog.slint # new / edit session dialog
-│   └── terminal_view.slint  # terminal view (v0.1 line-buffered)
-└── src/
-    ├── main.rs
-    ├── app.rs               # UI ↔ backend bridge
-    ├── config.rs            # session JSON persistence
-    ├── system.rs            # CPU / memory / network sampling
-    └── ssh.rs               # SSH session worker
+├── src/                  # state, protocol, system sampling, and backend logic
+├── ui/                   # Slint screens, theme, and reusable components
+├── assets/               # icons, install scripts, and platform metadata
+├── lang/                 # Chinese and English translations
+├── packaging/            # distribution packaging
+└── scripts/              # local build helpers
 ```
 
-## Development notes
+## Stack
 
-- Slint widgets use a strict layout DSL; after editing a `.slint` file,
-  `cargo check` is the fastest feedback loop.
-- The application event loop is single-threaded (required by Slint); all
-  cross-thread UI updates go through `slint::invoke_from_event_loop` callbacks.
-- `check_server_key` currently accepts any server key (like
-  `StrictHostKeyChecking=no`); wire up known-hosts verification before
-  production use.
+- UI: [Slint](https://slint.dev)
+- Async runtime: [Tokio](https://tokio.rs/)
+- SSH: [russh](https://crates.io/crates/russh)
+- System metrics: [sysinfo](https://crates.io/crates/sysinfo)
+- Serialization: `serde`, `serde_json`
+
+## Roadmap
+
+- [ ] Store session passwords in the system keychain
+- [ ] Split terminal panes
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0.
+Dual-licensed under MIT OR Apache-2.0; see `Cargo.toml` for the declaration.

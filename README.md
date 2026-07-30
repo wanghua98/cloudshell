@@ -1,135 +1,132 @@
-# cloudshell
+# Cloudshell
 
 **简体中文** | [English](./README.en.md)
 
-一个轻量级、低内存占用的 SSH / 终端客户端，灵感来自 FinalShell，但完全由
-**Rust + [Slint](https://slint.dev)** 实现。目标是保留 FinalShell 的核心体验
-（资源监控侧栏、会话管理、多标签页终端）的同时，把内存占用从 400 MB+ 的
-JVM 压到几十 MB 原生级别。
+> 轻量、原生、专为日常远程工作设计的 SSH 与终端客户端。
 
-## 截图
+Cloudshell 使用 Rust 与 [Slint](https://slint.dev) 构建，提供多会话终端、文件传输、端口转发和本地/远端资源监控。它希望保留专业 SSH 客户端的核心工作流，同时避免 JVM 应用常见的高内存占用。
 
-<p align="center">
-  <img src="docs/screenshots/01-welcome.png" alt="欢迎页 / 会话管理" width="800"><br>
-  <em>欢迎页：会话管理 + 左侧本机资源监控</em>
-</p>
+## 为什么使用 Cloudshell
 
-<p align="center">
-  <img src="docs/screenshots/02-terminal-btop.png" alt="终端 + SFTP" width="800"><br>
-  <em>多标签页终端（btop 全屏渲染）+ 底部 SFTP 文件浏览 + 远端资源监控</em>
-</p>
+- **原生且轻量**：Rust 二进制、无 GC，适合长期保持多个连接。
+- **一个工作区完成远程工作**：终端、SFTP、资源面板和会话管理无需在多个工具间切换。
+- **按你的 SSH 习惯工作**：支持密码、私钥、加密私钥和 `~/.ssh/config` 导入。
+- **跨平台**：提供 Windows、Linux 与 macOS 构建产物。
 
-## 下载与安装
+## 主要功能
 
-每次打 `v*` 标签，GitHub Actions 会自动构建 **Windows / Linux / macOS** 三平台二进制，
-发布到 [Releases](https://github.com/jeff141/cloudshell/releases) 页面。
+| 能力 | 说明 |
+| --- | --- |
+| SSH 与终端 | VT/ANSI 终端模拟；支持 `vim`、`htop`、`btop` 等全屏程序和多标签会话。 |
+| 会话管理 | 创建、编辑、删除、分组、复制、导入和导出连接配置。 |
+| SFTP 与传输 | 浏览远端文件、上传下载、拖拽传输，以及终端内 ZMODEM（`sz`）接收。 |
+| 监控 | 查看本机与远端的 CPU、内存、交换、网络、磁盘、进程和系统信息。 |
+| 连接方式 | SSH 密码/私钥认证，串口和 Telnet 会话，SOCKS5/HTTP 出站代理。 |
+| 隧道 | 本地转发（`-L`）、远程转发（`-R`）和动态 SOCKS5 转发（`-D`）。 |
+| 效率工具 | 快捷命令、命令历史，以及向全部在线会话广播输入。 |
+| 安全 | 首次连接时确认主机密钥；密钥变化会警告；会话密码以 ChaCha20-Poly1305 加密保存。 |
+
+## 安装
+
+在 GitHub 的 [Releases](https://github.com/jeff141/cloudshell/releases) 页面下载对应平台的构建包。每个 `v*` 标签均会触发 Windows、Linux 和 macOS 的自动构建。
 
 ### Windows
 
-下载 `cloudshell-*-windows-x86_64.zip`，解压后双击 `cloudshell.exe`。
+下载 `cloudshell-*-windows-x86_64.zip`，解压后运行 `cloudshell.exe`。
 
 ### Linux
 
 ```bash
 tar -xzf cloudshell-*-linux-x86_64.tar.gz
 cd cloudshell-*-linux-x86_64
-./cloudshell                                  # 直接运行
-# 可选：装应用图标 + 启动器入口（Dock / 应用列表里显示图标，无需传参）
+./cloudshell
+
+# 可选：安装应用菜单和 Dock 图标
 chmod +x install-linux.sh && ./install-linux.sh
 ```
 
-> 需要 glibc ≥ 2.35（Ubuntu 22.04+ / Debian 12+）。Wayland 下首次装完图标可能要注销重登一次。
+需要 glibc 2.35 或更新版本（例如 Ubuntu 22.04+、Debian 12+）。Wayland 下安装图标后可能需要重新登录一次。
 
 ### macOS
 
 ```bash
-tar -xzf cloudshell-*-macos-*.tar.gz          # aarch64 = Apple 芯片，x86_64 = Intel
-xattr -dr com.apple.quarantine cloudshell     # 去掉「未签名应用」的 Gatekeeper 拦截
+tar -xzf cloudshell-*-macos-*.tar.gz
+xattr -dr com.apple.quarantine cloudshell
 ./cloudshell
 ```
 
-> 从源码构建见下方 [运行](#运行)。
+`aarch64` 对应 Apple 芯片，`x86_64` 对应 Intel 芯片。未签名构建可能需要上述命令移除隔离属性。
 
-## 功能
+## 快速开始
 
-### 已实现
+1. 启动 Cloudshell，点击右上角的 **新建会话**。
+2. 输入主机地址、端口和用户名，选择密码或私钥认证。
+3. 保存后点击会话即可连接；首次连接时，核对并确认主机密钥指纹。
+4. 在底部打开 SFTP，在左侧查看资源，在工具栏使用隧道、快捷命令和同步输入。
 
-- [x] FinalShell 风格 UI，深色 / 浅色 / 跟随系统主题
-- [x] 本机 + 远端资源监控（CPU / 内存 / 交换 / 网络 / 磁盘）
-- [x] 远端进程监控（按 CPU 排序的只读进程表）
-- [x] 完整 VT/ANSI 终端模拟（btop / htop / vim 全屏正常渲染）
-- [x] 多标签页（欢迎页 + 多个会话）
-- [x] 会话管理：新建 / 编辑 / 删除 / 分组，本地 JSON 持久化，导出 / 导入
-  - 配置位置：`%APPDATA%/cloudshell/sessions.json`（Windows）
-    / `~/.config/cloudshell/sessions.json`（Linux）
-    / `~/Library/Application Support/cloudshell/sessions.json`（macOS）
-- [x] SSH（`russh`，纯 Rust）：密码 / 私钥 / 加密私钥（密码短语）
-- [x] SFTP 文件浏览 + 上传 / 下载（拖拽）+ 终端内 ZMODEM（`sz`）接收
-- [x] SSH 端口转发 / 隧道：本地 -L / 远程 -R / 动态 -D（SOCKS5）
-- [x] 快捷命令 + 命令输入框（可群发到所有会话）+ 命令历史
-- [x] 串口 / Telnet 会话
-- [x] 出站代理（SOCKS5 / HTTP）
-- [x] 导入 `~/.ssh/config`
-- [x] 会话密码加密存储（ChaCha20-Poly1305）
+会话数据保存在本机：
 
-### 计划中
+- Windows：`%APPDATA%/cloudshell/sessions.json`
+- Linux：`~/.config/cloudshell/sessions.json`
+- macOS：`~/Library/Application Support/cloudshell/sessions.json`
 
-- [ ] 已知主机 (known_hosts) 校验
-- [ ] 会话密码改用 OS 钥匙串存储
-- [ ] 多标签页终端分屏
+## 导入 OpenSSH 配置
 
-## 技术栈
+如果你已使用 OpenSSH，可在设置中选择 **导入 `~/.ssh/config`**。Cloudshell 会把每个具体的 `Host` 条目创建为会话，读取以下字段：
 
-| 模块          | 选型                                                              |
-| ------------- | ----------------------------------------------------------------- |
-| UI            | [Slint](https://slint.dev)（纯 Rust 编译，无 GC）                 |
-| 异步运行时    | [`tokio`](https://tokio.rs)                                       |
-| SSH 协议      | [`russh`](https://crates.io/crates/russh)（无 libssh 依赖）       |
-| 系统指标      | [`sysinfo`](https://crates.io/crates/sysinfo)                     |
-| 序列化        | `serde` + `serde_json`                                            |
-| 日志          | `tracing` + `tracing-subscriber`                                  |
+```sshconfig
+Host production
+  HostName 10.0.0.5
+  User deploy
+  Port 2222
+  IdentityFile ~/.ssh/id_ed25519
+```
 
-## 运行
+- 支持 `Host`、`HostName`、`User`、`Port`、`IdentityFile`。
+- `Host *` 等通配规则和不支持的 OpenSSH 指令不会导入。
+- 重名，或“相同主机 + 相同用户”的会话会跳过；未设置用户时默认使用 `root`。
+- 导入只创建/补充 Cloudshell 会话，不会修改你的 `~/.ssh/config`。
+
+## 从源码运行
+
+前提：Rust 1.75 或更高版本，以及目标平台所需的 GUI 构建依赖。
 
 ```bash
 cargo run --release
 ```
 
-首次启动会在 `%APPDATA%/cloudshell/sessions.json` 建立空的会话库。点击右上
-角 **“＋ 新建会话”** 添加第一台服务器。
+常用开发检查：
 
-## 项目布局
-
+```bash
+cargo check
+cargo test
 ```
+
+## 项目结构
+
+```text
 cloudshell/
-├── Cargo.toml
-├── build.rs                 # Slint 编译器入口
-├── ui/
-│   ├── app.slint            # 顶层窗口
-│   ├── theme.slint          # 设计 tokens
-│   ├── widgets.slint        # 可复用按钮 / 输入框 / sparkline
-│   ├── sidebar.slint        # 左侧系统监控面板
-│   ├── tabs.slint           # 顶部标签栏
-│   ├── welcome.slint        # 欢迎页 / 快速连接
-│   ├── session_dialog.slint # 新建 / 编辑会话弹框
-│   └── terminal_view.slint  # 终端视图（v0.1 行缓冲）
-└── src/
-    ├── main.rs
-    ├── app.rs               # UI ↔ 后端桥接
-    ├── config.rs            # 会话 JSON 持久化
-    ├── system.rs            # CPU / 内存 / 网络采样
-    └── ssh.rs               # SSH 会话 worker
+├── src/                  # 应用状态、连接协议、系统采样与后端逻辑
+├── ui/                   # Slint 界面、主题和可复用组件
+├── assets/               # 图标、安装脚本与平台元数据
+├── lang/                 # 中英文翻译
+├── packaging/            # 发行包配置
+└── scripts/              # 本地构建辅助脚本
 ```
 
-## 开发提示
+## 技术栈
 
-- Slint 控件有非常严格的布局 DSL，改 `.slint` 后 `cargo check` 是最快的
-  反馈方式。
-- 应用事件循环是单线程（Slint 要求），所有跨线程 UI 更新通过
-  `slint::invoke_from_event_loop` 回调。
-- 目前 `check_server_key` 接受任意服务端密钥（类似 `StrictHostKeyChecking=no`），
-  生产使用前请接入 known_hosts 校验。
+- UI：[Slint](https://slint.dev)
+- 异步运行时：[Tokio](https://tokio.rs/)
+- SSH：[russh](https://crates.io/crates/russh)
+- 系统指标：[sysinfo](https://crates.io/crates/sysinfo)
+- 数据序列化：`serde`、`serde_json`
 
-## License
+## 路线图
 
-MIT OR Apache-2.0（双许可）。
+- [ ] 使用系统钥匙串保存会话密码
+- [ ] 终端分屏
+
+## 许可证
+
+本项目采用 MIT OR Apache-2.0 双许可证；具体声明见 `Cargo.toml`。
