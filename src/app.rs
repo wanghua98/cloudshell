@@ -241,6 +241,10 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
+        window.set_term_cursor_style(s.cursor_style().into());
+        let cursor_hex = normalized_cursor_hex(s.cursor_color());
+        window.set_term_cursor_color_hex(cursor_hex.clone().into());
+        window.set_term_cursor_color(cursor_color_from_hex(&cursor_hex));
     }
     // Editable inputs (e.g. the SFTP path bar) need a CJK-capable font: the
     // embedded mono font has no Chinese glyphs and native TextInput doesn't
@@ -355,6 +359,39 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_family(family);
+            }
+        });
+    }
+    // Terminal cursor appearance applies immediately and is persisted with the
+    // rest of the interface preferences.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_cursor_style(move |style: SharedString| {
+            let style = style.to_string();
+            {
+                let mut s = store.borrow_mut();
+                s.set_cursor_style(style.clone());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_style(style.into());
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_cursor_color(move |value: SharedString| {
+            let hex = normalized_cursor_hex(value.as_str());
+            {
+                let mut s = store.borrow_mut();
+                s.set_cursor_color(hex.clone());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_color_hex(hex.clone().into());
+                w.set_term_cursor_color(cursor_color_from_hex(&hex));
             }
         });
     }
@@ -818,6 +855,7 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let sh = sftp_handles.clone();
         let close_handles = handles.clone();
+        let wheel_bufs = bufs.clone();
         let activity = window_activity.clone();
         let sampling_timer = timer.clone();
         window.window().on_winit_window_event(move |_w, event| {
@@ -826,6 +864,39 @@ pub fn run() -> Result<()> {
                     if let Some(win) = weak.upgrade() {
                         handle_file_drop(&win, &sh, path.to_string_lossy().to_string());
                     }
+                }
+                // Slint's femtovg path can miss high-resolution macOS trackpad
+                // wheel events. Feed them to the same scrollback/alt-screen
+                // behavior as the Slint hit layer.
+                #[cfg(target_os = "macos")]
+                WEvent::MouseWheel { delta, .. } => {
+                    use i_slint_backend_winit::winit::event::MouseScrollDelta;
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                    };
+                    if dy == 0.0 { return EventResult::Propagate; }
+                    if let Some(win) = weak.upgrade() {
+                        let tid = win.get_active_tab_id().to_string();
+                        let alt = wheel_bufs.lock().unwrap().get(&tid)
+                            .is_some_and(|b| b.parser.screen().alternate_screen());
+                        if alt {
+                            if let Some(handle) = close_handles.borrow().get(&tid) {
+                                handle.send_raw(if dy > 0.0 { b"\x1b[A".to_vec() } else { b"\x1b[B".to_vec() });
+                            }
+                        } else {
+                            {
+                                let mut map = wheel_bufs.lock().unwrap();
+                                if let Some(buf) = map.get_mut(&tid) {
+                                    let delta = if dy > 0.0 { 3 } else { -3 };
+                                    buf.view_offset = (buf.view_offset as i64 + delta)
+                                        .clamp(0, buf.history.len() as i64) as usize;
+                                }
+                            }
+                            rebuild_tab_display(&win, &wheel_bufs, &tid);
+                        }
+                    }
+                    return EventResult::PreventDefault;
                 }
                 WEvent::Focused(focused) => {
                     if let Some(win) = weak.upgrade() {
@@ -1915,6 +1986,8 @@ struct ConnectCtx {
 /// already-registered tab. Used by the initial connect and by in-place
 /// reconnect (#79); the tab/terminal/parser must already exist.
 fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
+    let session_start = std::time::Instant::now();
+    tracing::debug!(tab_id, "SESSION_START shell spawn");
     let has_sftp = session.kind == SessionKind::Ssh;
     let (initial_cols, initial_rows) = *ctx.last_term_size.lock().unwrap();
     let (handle, rx) = match session.kind {
@@ -1939,6 +2012,11 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         ),
     };
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
+    tracing::debug!(
+        tab_id,
+        elapsed_ms = session_start.elapsed().as_millis(),
+        "SESSION_START terminal ready"
+    );
 
     // Separate SFTP connection for the same session (SSH only).
     let sftp_evt_tx = if has_sftp {
@@ -1952,6 +2030,11 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     } else {
         None
     };
+    tracing::debug!(
+        tab_id,
+        elapsed_ms = session_start.elapsed().as_millis(),
+        "SESSION_START auxiliary workers started"
+    );
 
     // --- Shell event pump (dedicated thread) ---
     {
@@ -5470,6 +5553,20 @@ fn vt_color_to_slint(color: vt100::Color, bold: bool, is_dark: bool) -> slint::C
         }
     };
     slint::Color::from_rgb_u8(r, g, b)
+}
+
+fn normalized_cursor_hex(input: &str) -> String {
+    let value = input.trim().trim_start_matches('#');
+    if value.len() == 6 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        value.to_ascii_uppercase()
+    } else {
+        "D4D4D4".into()
+    }
+}
+
+fn cursor_color_from_hex(hex: &str) -> slint::Color {
+    let parse = |range| u8::from_str_radix(&hex[range], 16).unwrap_or(0xd4);
+    slint::Color::from_rgb_u8(parse(0..2), parse(2..4), parse(4..6))
 }
 
 /// In light mode, remap light true-colour foregrounds to dark so they are

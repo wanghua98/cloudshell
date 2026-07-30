@@ -287,6 +287,12 @@ pub struct ConfigFile {
     /// Terminal font size in px. 0 = the built-in default.
     #[serde(default)]
     pub font_size: u32,
+    /// Block, bar or underline terminal cursor.
+    #[serde(default)]
+    pub cursor_style: String,
+    /// Six-digit RGB cursor colour without a leading #. Empty = default.
+    #[serde(default)]
+    pub cursor_color: String,
     /// Global UI scale in percent (#100). 0 = default (100%).
     #[serde(default)]
     pub ui_scale: u32,
@@ -579,6 +585,28 @@ impl ConfigStore {
 
     pub fn set_font_size(&mut self, size: u32) {
         self.cache.font_size = size.clamp(8, 32);
+    }
+
+    pub fn cursor_style(&self) -> &str {
+        match self.cache.cursor_style.as_str() {
+            "bar" | "underline" => &self.cache.cursor_style,
+            _ => "block",
+        }
+    }
+
+    pub fn set_cursor_style(&mut self, style: String) {
+        self.cache.cursor_style = match style.as_str() {
+            "bar" | "underline" => style,
+            _ => "block".into(),
+        };
+    }
+
+    pub fn cursor_color(&self) -> &str {
+        &self.cache.cursor_color
+    }
+
+    pub fn set_cursor_color(&mut self, color: String) {
+        self.cache.cursor_color = color;
     }
 
     /// Global UI scale in percent (#100). Defaults to 100.

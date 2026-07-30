@@ -86,6 +86,8 @@ component MenuItem inherits Rectangle {
 export component TerminalView inherits Rectangle {
     in property <string> tab-id;
     in property <bool> is-macos: false;
+    in property <string> cursor-style: "block";
+    in property <color> cursor-color: Theme.term-fg;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
     in property <int> cursor-row;       // cursor cell (grid coords)
@@ -439,6 +441,10 @@ export component TerminalView inherits Rectangle {
                                 // so the full-screen UI isn't pushed out of view.
                                 if (!root.is-alt-screen) {
                                     root.terminal-scroll(ev.delta-y > 0 ? 3 : -3);
+                                } else {
+                                    // Full-screen applications own their scrollback;
+                                    // map wheel/trackpad movement to cursor keys.
+                                    root.send-key(ev.delta-y > 0 ? Key.UpArrow : Key.DownArrow, false, false, false);
                                 }
                                 accept
                             }
@@ -496,10 +502,10 @@ export component TerminalView inherits Rectangle {
                         // Blinking block cursor (overlay, decoupled from text).
                         Rectangle {
                             x: root.cursor-col * root.cell-w;
-                            y: root.cursor-row * root.cell-h;
-                            width: root.cell-w;
-                            height: root.cell-h;
-                            background: Theme.term-fg;
+                            y: root.cursor-row * root.cell-h + (root.cursor-style == "underline" ? root.cell-h - 2px : 0px);
+                            width: root.cursor-style == "bar" ? 2px : root.cell-w;
+                            height: root.cursor-style == "underline" ? 2px : root.cell-h;
+                            background: root.cursor-color;
                             // In the background keep the cursor visible but stop
                             // the 530ms animation, avoiding full-window redraws.
                             visible: !Theme.window-focused || (ime-input.has-focus && key-capture.cursor-blink);

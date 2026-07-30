@@ -7,6 +7,15 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ### Changed / 优化
 
+- **Faster terminal startup and configurable cursor.** Shell output is shown as
+  soon as the PTY is ready while auxiliary services continue in the background;
+  cursor shape (block/bar/underline) and RGB colour are now saved interface
+  settings. macOS trackpad scrolling is also handled at both the terminal hit
+  layer and winit level.
+  **终端更快首屏并支持光标配置。** PTY 就绪后立即显示 shell 输出，辅助服务继续后台启动；
+  光标形状（块状/竖线/下划线）和 RGB 颜色现可保存。macOS 触控板滚动同时由终端命中层与
+  winit 兜底处理。
+
 - **Quieter startup logs.** Silenced fontdb's harmless "malformed font" warning for
   system fonts it can't parse but skips anyway (e.g. Windows' `mstmc.ttf`), and
   demoted the routine UI-font-selection line to `debug` — only an actual font-load

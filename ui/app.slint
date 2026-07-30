@@ -291,8 +291,13 @@ export component AppWindow inherits Window {
     changed dark-mode => { Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light; }
     in-out property <string> term-font-family <=> Theme.term-font-family;
     in-out property <length> term-font-size <=> Theme.term-font-size;
+    in-out property <string> term-cursor-style: "block";
+    in-out property <color> term-cursor-color: #d4d4d4;
+    in-out property <string> term-cursor-color-hex: "D4D4D4";
     in-out property <float> ui-scale <=> Theme.ui-scale;   // global UI zoom (#100)
     in-out property <string> ui-font-family <=> Theme.ui-font-family;
+    callback set-cursor-style(string);
+    callback set-cursor-color(string);
     in property <[string]> term-fonts;             // installed monospace families
     in-out property <bool> interface-open: false;  // Interface settings dialog
     // Interface dialog position (draggable by its title bar); init centered.
@@ -696,6 +701,8 @@ export component AppWindow inherits Window {
                     height: term.id == root.active-tab-id ? parent.height : 0px;
                     tab-id: term.id;
                     is-macos: root.is-macos;
+                    cursor-style: root.term-cursor-style;
+                    cursor-color: root.term-cursor-color;
                     status-line: term.status;
                     spans: term.spans;
                     cursor-row: term.cursor-row;
@@ -2574,6 +2581,37 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text { text: root.lang-en ? "Cursor" : "光标";
+                                       color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    for style in ["block", "bar", "underline"] : Button {
+                                        text: style == "block" ? (root.lang-en ? "Block" : "块状")
+                                            : (style == "bar" ? (root.lang-en ? "Bar" : "竖线")
+                                            : (root.lang-en ? "Underline" : "下划线"));
+                                        primary: root.term-cursor-style == style;
+                                        clicked => { root.set-cursor-style(style); }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Text { text: "#"; color: Theme.text-secondary; vertical-alignment: center; }
+                                    LineEdit {
+                                        width: 104px;
+                                        text <=> root.term-cursor-color-hex;
+                                        edited => { root.set-cursor-color(self.text); }
+                                    }
+                                    for c in ["D4D4D4", "4A90E2", "4EC9B0", "E2A84A", "E25C5C"] : Rectangle {
+                                        width: 20px; height: 20px; border-radius: 10px;
+                                        background: c == "D4D4D4" ? #d4d4d4 : (c == "4A90E2" ? #4a90e2 : (c == "4EC9B0" ? #4ec9b0 : (c == "E2A84A" ? #e2a84a : #e25c5c)));
+                                        c-ta := TouchArea { mouse-cursor: pointer; clicked => { root.set-cursor-color(c); } }
+                                    }
                                 }
                             }
 
