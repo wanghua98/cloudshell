@@ -45,6 +45,82 @@ slint::include_modules!();
 /// Number of samples kept for the sparkline.
 const NET_HISTORY_LEN: usize = 60;
 
+const BACKGROUND_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const FOREGROUND_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SamplingCadence {
+    Foreground,
+    Background,
+    Suspended,
+}
+
+impl SamplingCadence {
+    fn interval(self) -> std::time::Duration {
+        match self {
+            Self::Foreground => FOREGROUND_SAMPLE_INTERVAL,
+            Self::Background => BACKGROUND_SAMPLE_INTERVAL,
+            Self::Suspended => unreachable!("suspended sampling has no interval"),
+        }
+    }
+}
+
+/// Window state relevant to work that would otherwise trigger a full Slint
+/// redraw. All access happens on Slint's event-loop thread.
+struct WindowActivity {
+    focused: bool,
+    occluded: bool,
+    minimized: bool,
+    cadence: SamplingCadence,
+}
+
+impl Default for WindowActivity {
+    fn default() -> Self {
+        Self {
+            focused: true,
+            occluded: false,
+            minimized: false,
+            cadence: SamplingCadence::Foreground,
+        }
+    }
+}
+
+impl WindowActivity {
+    fn refresh_cadence(&mut self) -> Option<SamplingCadence> {
+        let next = if self.minimized || self.occluded {
+            SamplingCadence::Suspended
+        } else if self.focused {
+            SamplingCadence::Foreground
+        } else {
+            SamplingCadence::Background
+        };
+        if next == self.cadence {
+            None
+        } else {
+            self.cadence = next;
+            Some(next)
+        }
+    }
+}
+
+fn apply_sampling_cadence(timer: &slint::Timer, cadence: SamplingCadence) {
+    match cadence {
+        SamplingCadence::Suspended => timer.stop(),
+        SamplingCadence::Background => {
+            timer.set_interval(BACKGROUND_SAMPLE_INTERVAL);
+            if !timer.running() {
+                timer.restart();
+            }
+        }
+        SamplingCadence::Foreground => {
+            // Wake promptly on focus regain, then the timer callback restores
+            // the normal one-second interval after the immediate sample.
+            timer.set_interval(std::time::Duration::from_millis(1));
+            timer.restart();
+        }
+    }
+}
+
 /// Embed the app icon PNG into the binary and set it as the X11 window icon.
 ///
 /// On X11, the taskbar/dock icon for a running window comes from the
@@ -694,16 +770,23 @@ pub fn run() -> Result<()> {
 
     // --- System sampler (1 Hz) ------------------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
+    let window_activity = Rc::new(RefCell::new(WindowActivity::default()));
     let weak = window.as_weak();
     let tick_sampler = sampler.clone();
     let tick_statuses = tab_statuses.clone();
     let tick_local = local_snap.clone();
     let tick_net = local_net_hist.clone();
-    let timer = slint::Timer::default();
+    let timer = Rc::new(slint::Timer::default());
+    let timer_weak = Rc::downgrade(&timer);
+    let tick_activity = window_activity.clone();
     timer.start(
         slint::TimerMode::Repeated,
-        SystemSampler::recommended_interval(),
+        FOREGROUND_SAMPLE_INTERVAL,
         move || {
+            let cadence = tick_activity.borrow().cadence;
+            if cadence == SamplingCadence::Suspended {
+                return;
+            }
             let snap = {
                 let mut s = tick_sampler.lock().expect("sampler poisoned");
                 s.sample()
@@ -720,12 +803,11 @@ pub fn run() -> Result<()> {
                 // active tab; refresh_sidebar reads the stores we just updated.
                 refresh_sidebar(&w, &tick_statuses, &tick_local, &tick_net);
             }
+            if let Some(timer) = timer_weak.upgrade() {
+                timer.set_interval(cadence.interval());
+            }
         },
     );
-    // Keep the timer alive for the entire event loop by parking it on a
-    // leaked Box. Slint timers drop themselves on Drop, and we don't want
-    // that here.
-    Box::leak(Box::new(timer));
 
     // OS file drag-and-drop → upload to the active session's SFTP directory,
     // but only when the file is dropped over the file-list area.
@@ -735,6 +817,8 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let sh = sftp_handles.clone();
         let close_handles = handles.clone();
+        let activity = window_activity.clone();
+        let sampling_timer = timer.clone();
         window.window().on_winit_window_event(move |_w, event| {
             match event {
                 WEvent::DroppedFile(path) => {
@@ -742,7 +826,38 @@ pub fn run() -> Result<()> {
                         handle_file_drop(&win, &sh, path.to_string_lossy().to_string());
                     }
                 }
-                WEvent::Resized(_) => {
+                WEvent::Focused(focused) => {
+                    if let Some(win) = weak.upgrade() {
+                        win.set_window_focused(*focused);
+                    }
+                    let cadence = {
+                        let mut state = activity.borrow_mut();
+                        state.focused = *focused;
+                        state.refresh_cadence()
+                    };
+                    if let Some(cadence) = cadence {
+                        apply_sampling_cadence(&sampling_timer, cadence);
+                    }
+                }
+                WEvent::Occluded(occluded) => {
+                    let cadence = {
+                        let mut state = activity.borrow_mut();
+                        state.occluded = *occluded;
+                        state.refresh_cadence()
+                    };
+                    if let Some(cadence) = cadence {
+                        apply_sampling_cadence(&sampling_timer, cadence);
+                    }
+                }
+                WEvent::Resized(size) => {
+                    let cadence = {
+                        let mut state = activity.borrow_mut();
+                        state.minimized = size.width == 0 || size.height == 0;
+                        state.refresh_cadence()
+                    };
+                    if let Some(cadence) = cadence {
+                        apply_sampling_cadence(&sampling_timer, cadence);
+                    }
                     // Keep the maximize/restore icon (and resize-edge gating) in
                     // sync when the OS changes the window state (#119).
                     if let Some(win) = weak.upgrade() {

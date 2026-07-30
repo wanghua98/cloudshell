@@ -3,8 +3,6 @@
 //! `sysinfo` is already a dependency for many Rust desktop apps; it gives us
 //! cross-platform data with ~2% CPU overhead at 1-second cadence.
 
-use std::time::Duration;
-
 use sysinfo::{Disks, Networks, System};
 
 /// Snapshot passed to the UI each tick.
@@ -50,11 +48,6 @@ impl SystemSampler {
             last_tx_total,
             last_instant: std::time::Instant::now(),
         }
-    }
-
-    /// Recommended poll interval for a UI sidebar.
-    pub fn recommended_interval() -> Duration {
-        Duration::from_millis(1000)
     }
 
     pub fn sample(&mut self) -> SystemSnapshot {

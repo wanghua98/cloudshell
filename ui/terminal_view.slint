@@ -171,10 +171,15 @@ export component TerminalView inherits Rectangle {
     property <length> ctx-y;
     property <bool> find-active: false;
     property <bool> selecting: false;
+    property <bool> window-focused: Theme.window-focused;
     // Auto-scroll direction while drag-selecting past the visible edge.
     // 0 = none, -1 = above top (scroll to older), +1 = below bottom (newer).
     property <int> autoscroll-dir: 0;
     property <length> vis-y: 0px;   // scratch: cursor Y within the visible viewport
+
+    changed window-focused => {
+        if (root.window-focused) { key-capture.cursor-blink = true; }
+    }
 
     background: Theme.term-bg;
     forward-focus: ime-input;
@@ -311,7 +316,7 @@ export component TerminalView inherits Rectangle {
             init => { ime-input.focus(); }
 
             Timer {
-                running: ime-input.has-focus;
+                running: ime-input.has-focus && Theme.window-focused;
                 interval: 530ms;
                 triggered => { key-capture.cursor-blink = !key-capture.cursor-blink; }
             }
@@ -490,7 +495,9 @@ export component TerminalView inherits Rectangle {
                             width: root.cell-w;
                             height: root.cell-h;
                             background: Theme.term-fg;
-                            visible: ime-input.has-focus && key-capture.cursor-blink;
+                            // In the background keep the cursor visible but stop
+                            // the 530ms animation, avoiding full-window redraws.
+                            visible: !Theme.window-focused || (ime-input.has-focus && key-capture.cursor-blink);
                         }
 
                         // --- Right-click context menu ---------------------

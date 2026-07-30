@@ -280,6 +280,8 @@ export component AppWindow inherits Window {
     // Two-way binding to Theme.dark — Rust reads/writes this property and
     // Slint propagates it to every widget that references Theme colours.
     in-out property <bool> dark-mode <=> Theme.dark;
+    // winit keeps this in sync so terminal animations can pause in background.
+    in-out property <bool> window-focused <=> Theme.window-focused;
     // Keep Slint's std-widgets (LineEdit / Button / ComboBox in the dialogs) in
     // step with our theme — otherwise in light mode they keep the platform/dark
     // palette and their text/borders blend into the light dialog background.

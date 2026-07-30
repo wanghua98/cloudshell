@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use russh::client::{self, Handle, Handler, Msg};
+use russh::client::{self, Handle, Handler, KeyboardInteractiveAuthResponse, Msg};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::load_secret_key;
 use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
@@ -474,47 +474,7 @@ async fn run_session(
         session.port
     )));
 
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(60 * 10)),
-        ..<_>::default()
-    });
-
-    // Remote (-R) forwards are serviced inside the handler when the server
-    // opens channels back, so it needs the bind-port → local-target map up
-    // front (the handler is moved into `connect`) (#56).
-    let remote_forwards: std::collections::HashMap<u32, (String, u16)> = session
-        .forwards
-        .iter()
-        .filter(|f| f.kind == "remote")
-        .map(|f| (f.bind_port as u32, (f.host.clone(), f.host_port)))
-        .collect();
-    let handler = ClientHandler {
-        host: session.host.clone(),
-        port: session.port,
-        remote_forwards,
-        events: events.clone(),
-    };
-    let addr = format!("{}:{}", session.host, session.port);
-    // Connect directly, or tunnel through a SOCKS5 / HTTP proxy (issue #7).
-    let mut handle = match crate::proxy::resolve(&session.proxy) {
-        Some(p) => {
-            let _ = events.send(SessionEvent::Status(format!(
-                "{} {} → {}",
-                t("经代理连接", "via proxy"),
-                crate::proxy::describe(&p),
-                addr
-            )));
-            let stream = crate::proxy::connect(&p, &session.host, session.port)
-                .await
-                .with_context(|| format!("proxy connect to {} failed", addr))?;
-            client::connect_stream(config, stream, handler)
-                .await
-                .with_context(|| format!("connect {} failed", addr))?
-        }
-        None => client::connect(config, addr.as_str(), handler)
-            .await
-            .with_context(|| format!("connect {} failed", addr))?,
-    };
+    let mut handle = connect_ssh(&session, &events).await?;
 
     // Resolve missing username/password by prompting the user (#110).
     let (user, password) = match resolve_credentials(&session, &events).await {
@@ -532,10 +492,32 @@ async fn run_session(
 
     // --- Auth ----------------------------------------------------------
     let authed = match session.auth {
-        AuthMethod::Password => handle
-            .authenticate_password(&user, password.as_str())
-            .await
-            .context("password auth failed")?,
+        AuthMethod::Password => {
+            let password_authed = handle
+                .authenticate_password(&user, password.as_str())
+                .await
+                .context("password auth failed")?;
+            if password_authed {
+                true
+            } else {
+                // russh cannot safely start keyboard-interactive on a handle
+                // that has already failed password authentication. Close it and
+                // reconnect before retrying, as JumpServer-style bastions often
+                // offer only keyboard-interactive.
+                let _ = events.send(SessionEvent::Status(
+                    t(
+                        "密码认证失败，改用键盘交互认证…",
+                        "Password rejected; retrying keyboard-interactive…",
+                    )
+                    .into(),
+                ));
+                let _ = handle
+                    .disconnect(Disconnect::ByApplication, "retry keyboard-interactive", "")
+                    .await;
+                handle = connect_ssh(&session, &events).await?;
+                authenticate_keyboard_interactive(&mut handle, &user, password.as_str()).await?
+            }
+        }
         AuthMethod::Key => {
             let raw = session.private_key_path.trim();
             if raw.is_empty() {
@@ -952,6 +934,81 @@ async fn run_session(
         t("连接已关闭", "connection closed").into(),
     ));
     Ok(())
+}
+
+/// Establish a fresh SSH transport, including proxy tunnelling and the client
+/// handler required for remote port forwards. Authentication deliberately stays
+/// outside this function so callers can reconnect before changing methods.
+async fn connect_ssh(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Handle<ClientHandler>> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(60 * 10)),
+        ..<_>::default()
+    });
+    let remote_forwards = session
+        .forwards
+        .iter()
+        .filter(|forward| forward.kind == "remote")
+        .map(|forward| {
+            (
+                forward.bind_port as u32,
+                (forward.host.clone(), forward.host_port),
+            )
+        })
+        .collect();
+    let handler = ClientHandler {
+        host: session.host.clone(),
+        port: session.port,
+        remote_forwards,
+        events: events.clone(),
+    };
+    let address = format!("{}:{}", session.host, session.port);
+    match crate::proxy::resolve(&session.proxy) {
+        Some(proxy) => {
+            let _ = events.send(SessionEvent::Status(format!(
+                "{} {} → {}",
+                t("经代理连接", "via proxy"),
+                crate::proxy::describe(&proxy),
+                address
+            )));
+            let stream = crate::proxy::connect(&proxy, &session.host, session.port)
+                .await
+                .with_context(|| format!("proxy connect to {address} failed"))?;
+            client::connect_stream(config, stream, handler)
+                .await
+                .with_context(|| format!("connect {address} failed"))
+        }
+        None => client::connect(config, address.as_str(), handler)
+            .await
+            .with_context(|| format!("connect {address} failed")),
+    }
+}
+
+/// Authenticate through keyboard-interactive, replying with the configured
+/// password for every prompt. Servers may issue several rounds of prompts.
+async fn authenticate_keyboard_interactive(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    password: &str,
+) -> Result<bool> {
+    let mut response = handle
+        .authenticate_keyboard_interactive_start(user, None)
+        .await
+        .context("start keyboard-interactive auth failed")?;
+    loop {
+        response = match response {
+            KeyboardInteractiveAuthResponse::Success => return Ok(true),
+            KeyboardInteractiveAuthResponse::Failure => return Ok(false),
+            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => handle
+                .authenticate_keyboard_interactive_respond(
+                    prompts.into_iter().map(|_| password.to_owned()).collect(),
+                )
+                .await
+                .context("keyboard-interactive response failed")?,
+        };
+    }
 }
 
 /// Parse one monitor sample (a block of `/proc/stat` cpu line + `/proc/meminfo`
