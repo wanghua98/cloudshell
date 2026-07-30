@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
-import { CheckBox } from "std-widgets.slint";
+import { CheckBox, ComboBox } from "std-widgets.slint";
 
 // One SSH port-forward row shown in the session dialog (#56). `summary` is a
 // ready-to-display line like "-L 127.0.0.1:8080 → host:80".
@@ -30,6 +30,13 @@ export struct SessionDraft {
     parity: string,        // "none" | "odd" | "even"
     flow-control: string,  // "none" | "hardware" | "software"
     disable-shell-integration: bool,
+    jump-session: string,
+    host-key-policy: string, // "ask" | "strict" | "accept-new"
+    connect-timeout: int,
+    keepalive-interval: int,
+    keepalive-max: int,
+    initial-directory: string,
+    startup-command: string,
 }
 
 // A single segment in a segmented selector (auth toggle, baud presets, …).
@@ -114,6 +121,17 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-parity: "none";
     in-out property <string> draft-flow: "none";
     in-out property <bool> draft-disable-shell-integration: false;
+    in property <[string]> jump-options;
+    in-out property <string> draft-jump-session;
+    in-out property <string> draft-host-key-policy: "ask";
+    in-out property <string> draft-connect-timeout: "15";
+    in-out property <string> draft-keepalive-interval: "30";
+    in-out property <string> draft-keepalive-max: "3";
+    in-out property <string> draft-initial-directory;
+    in-out property <string> draft-startup-command;
+    in-out property <bool> test-running: false;
+    in-out property <bool> test-ok: false;
+    in-out property <string> test-result;
 
     // Port forwards / tunnels (#56). `forwards` is the current list (fed from
     // Rust); the nf-* properties hold the add-form fields.
@@ -132,6 +150,7 @@ export component SessionDialog inherits Rectangle {
                          string /* host */, int /* host-port */);
     callback delete-forward(int /* index */);
     callback pick-key-file();   // open a native file picker for the private key
+    callback test-connection(SessionDraft);
 
     visible: is-open;
     background: #000000aa;
@@ -146,7 +165,7 @@ export component SessionDialog inherits Rectangle {
     }
 
     Rectangle {
-        width: 440px;
+        width: min(560px, parent.width - 40px);
         // Height follows the content, but never exceeds the window — past that
         // the body scrolls (the dialog grows with the advanced section / many
         // port forwards) (#56).
@@ -338,7 +357,7 @@ export component SessionDialog inherits Rectangle {
                     }
                 }
                 Text {
-                    text: @tr("Pick the private key itself (not the .pub public key)");
+                    text: @tr("OpenSSH / PEM / PuTTY PPK private keys are supported (not .pub files)");
                     color: Theme.text-muted;
                     font-size: Theme.fs-xs;
                 }
@@ -437,6 +456,68 @@ export component SessionDialog inherits Rectangle {
                 if root.draft-kind == "ssh" : CheckBox {
                     text: @tr("Disable shell integration (Windows / restricted shells)");
                     checked <=> root.draft-disable-shell-integration;
+                }
+                if root.draft-kind == "ssh" : Text {
+                    text: @tr("Jump host");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                if root.draft-kind == "ssh" : ComboBox {
+                    model: root.jump-options;
+                    current-value: root.draft-jump-session;
+                    selected(value) => { root.draft-jump-session = value; }
+                }
+                if root.draft-kind == "ssh" : Text {
+                    text: @tr("The selected saved SSH session supplies the bastion credentials and host-key policy.");
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                    wrap: word-wrap;
+                }
+                if root.draft-kind == "ssh" : Text {
+                    text: @tr("Host key policy");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                if root.draft-kind == "ssh" : HorizontalLayout {
+                    spacing: 6px;
+                    SegOption { label: @tr("Ask"); active: root.draft-host-key-policy == "ask"; clicked => { root.draft-host-key-policy = "ask"; } }
+                    SegOption { label: @tr("Strict"); active: root.draft-host-key-policy == "strict"; clicked => { root.draft-host-key-policy = "strict"; } }
+                    SegOption { label: @tr("Accept new"); active: root.draft-host-key-policy == "accept-new"; clicked => { root.draft-host-key-policy = "accept-new"; } }
+                }
+                if root.draft-kind == "ssh" : Text {
+                    text: root.draft-host-key-policy == "strict"
+                        ? @tr("Only a matching saved host key is accepted.")
+                        : (root.draft-host-key-policy == "accept-new"
+                            ? @tr("New keys are saved automatically; changed keys are rejected.")
+                            : @tr("Unknown or changed keys require confirmation."));
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                    wrap: word-wrap;
+                }
+                if root.draft-kind == "ssh" : HorizontalLayout {
+                    spacing: 8px;
+                    LabeledInput {
+                        label: @tr("Connect timeout (s)");
+                        value <=> root.draft-connect-timeout;
+                    }
+                    LabeledInput {
+                        label: @tr("Keepalive (s, 0=off)");
+                        value <=> root.draft-keepalive-interval;
+                    }
+                    LabeledInput {
+                        label: @tr("Miss limit");
+                        value <=> root.draft-keepalive-max;
+                    }
+                }
+                if root.draft-kind == "ssh" : LabeledInput {
+                    label: @tr("Initial directory (optional)");
+                    placeholder: "/var/www/app";
+                    value <=> root.draft-initial-directory;
+                }
+                if root.draft-kind == "ssh" : LabeledInput {
+                    label: @tr("Startup command (optional)");
+                    placeholder: "tmux attach || tmux";
+                    value <=> root.draft-startup-command;
                 }
                 Text {
                     text: @tr("Proxy (optional)");
@@ -557,9 +638,57 @@ export component SessionDialog inherits Rectangle {
                 }
             }
 
+            if root.test-result != "" : Text {
+                text: root.test-result;
+                color: root.test-ok ? Theme.success : Theme.danger;
+                font-size: Theme.fs-sm;
+                wrap: word-wrap;
+            }
+
             HorizontalLayout {
                 alignment: end;
                 spacing: 8px;
+                if root.draft-kind == "ssh" : GhostButton {
+                    text: root.test-running ? @tr("Testing…") : @tr("Test connection");
+                    enabled: !root.test-running;
+                    clicked => {
+                        if (root.draft-host == "") {
+                            root.host-missing = true;
+                            return;
+                        }
+                        root.host-missing = false;
+                        root.test-connection({
+                            id: root.draft-id,
+                            name: root.draft-name,
+                            kind: root.draft-kind,
+                            host: root.draft-host,
+                            port: root.draft-port.to-float(),
+                            user: root.draft-user,
+                            auth: root.draft-auth,
+                            password: root.draft-password,
+                            private-key-path: root.draft-key-path,
+                            proxy: (root.draft-proxy-type == "none" || root.draft-proxy-hostport == "") ? ""
+                                 : root.draft-proxy-type == "http" ? "http://" + root.draft-proxy-hostport
+                                 : "socks5://" + root.draft-proxy-hostport,
+                            group: root.draft-group,
+                            serial-port: root.draft-serial-port,
+                            baud-rate: root.draft-baud.to-float(),
+                            data-bits: root.draft-data-bits.to-float(),
+                            stop-bits: root.draft-stop-bits.to-float(),
+                            parity: root.draft-parity,
+                            flow-control: root.draft-flow,
+                            disable-shell-integration: root.draft-disable-shell-integration,
+                            jump-session: root.draft-jump-session,
+                            host-key-policy: root.draft-host-key-policy,
+                            connect-timeout: root.draft-connect-timeout.to-float(),
+                            keepalive-interval: root.draft-keepalive-interval.to-float(),
+                            keepalive-max: root.draft-keepalive-max.to-float(),
+                            initial-directory: root.draft-initial-directory,
+                            startup-command: root.draft-startup-command,
+                        });
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
                 GhostButton {
                     text: @tr("Cancel");
                     clicked => { root.cancel(); }
@@ -594,6 +723,13 @@ export component SessionDialog inherits Rectangle {
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
                             disable-shell-integration: root.draft-disable-shell-integration,
+                            jump-session: root.draft-jump-session,
+                            host-key-policy: root.draft-host-key-policy,
+                            connect-timeout: root.draft-connect-timeout.to-float(),
+                            keepalive-interval: root.draft-keepalive-interval.to-float(),
+                            keepalive-max: root.draft-keepalive-max.to-float(),
+                            initial-directory: root.draft-initial-directory,
+                            startup-command: root.draft-startup-command,
                         });
                     }
                 }

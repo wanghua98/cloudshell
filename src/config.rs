@@ -153,6 +153,49 @@ impl AuthMethod {
     }
 }
 
+/// Policy used when the server presents an SSH host key.
+///
+/// `AcceptNew` is intentionally not "accept anything": it trusts a key only
+/// when no key has been recorded yet, and still rejects a changed key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostKeyPolicy {
+    #[default]
+    Ask,
+    Strict,
+    AcceptNew,
+}
+
+impl HostKeyPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Strict => "strict",
+            Self::AcceptNew => "accept-new",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "strict" => Self::Strict,
+            "accept-new" => Self::AcceptNew,
+            _ => Self::Ask,
+        }
+    }
+}
+
+fn default_connect_timeout() -> u16 {
+    15
+}
+
+fn default_keepalive_interval() -> u16 {
+    30
+}
+
+fn default_keepalive_max() -> u8 {
+    3
+}
+
 /// A single saved SSH target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -207,6 +250,30 @@ pub struct Session {
     /// Windows shells (pwsh/cmd) and restricted appliance consoles.
     #[serde(default)]
     pub disable_shell_integration: bool,
+
+    // --- SSH connection and startup policy --------------------------------
+    /// ID of another saved SSH session used as a single-hop bastion.
+    #[serde(default)]
+    pub jump_session_id: String,
+    /// Runtime-only resolved bastion. The app fills this from
+    /// `jump_session_id` before starting terminal/SFTP/test workers.
+    #[serde(skip)]
+    pub jump_session: Option<Box<Session>>,
+    #[serde(default)]
+    pub host_key_policy: HostKeyPolicy,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u16,
+    /// Zero disables SSH keepalives.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_secs: u16,
+    #[serde(default = "default_keepalive_max")]
+    pub keepalive_max: u8,
+    /// Directory entered immediately after the interactive shell starts.
+    #[serde(default)]
+    pub initial_directory: String,
+    /// Command sent after `initial_directory` has been applied.
+    #[serde(default)]
+    pub startup_command: String,
 }
 
 /// One SSH tunnel (#56). `kind` is "local" (-L), "remote" (-R) or
@@ -252,6 +319,14 @@ impl Session {
             flow_control: default_flow(),
             forwards: Vec::new(),
             disable_shell_integration: false,
+            jump_session_id: String::new(),
+            jump_session: None,
+            host_key_policy: HostKeyPolicy::default(),
+            connect_timeout_secs: default_connect_timeout(),
+            keepalive_interval_secs: default_keepalive_interval(),
+            keepalive_max: default_keepalive_max(),
+            initial_directory: String::new(),
+            startup_command: String::new(),
         }
     }
 }
@@ -293,7 +368,7 @@ pub struct ConfigFile {
     /// Six-digit RGB cursor colour without a leading #. Empty = default.
     #[serde(default)]
     pub cursor_color: String,
-    /// Global UI scale in percent (#100). 0 = default (100%).
+    /// Global UI scale in percent (#100). 0 = platform default.
     #[serde(default)]
     pub ui_scale: u32,
     /// Explicit session groups/folders (#41), including empty ones so a folder
@@ -574,10 +649,16 @@ impl ConfigStore {
         self.cache.font_family = family;
     }
 
-    /// Terminal font size in px (falls back to 13 when unset).
+    /// Terminal font size in px. macOS uses a slightly larger default because
+    /// grayscale GPU text at 13 logical pixels looks noticeably softer on
+    /// Retina displays; explicit user settings always win.
     pub fn font_size(&self) -> u32 {
         if self.cache.font_size == 0 {
-            13
+            if cfg!(target_os = "macos") {
+                14
+            } else {
+                13
+            }
         } else {
             self.cache.font_size
         }
@@ -609,10 +690,16 @@ impl ConfigStore {
         self.cache.cursor_color = color;
     }
 
-    /// Global UI scale in percent (#100). Defaults to 100.
+    /// Global UI scale in percent (#100). Keep macOS text at a native-looking
+    /// readable size under FemtoVG's grayscale antialiasing; saved values still
+    /// override this platform default.
     pub fn ui_scale(&self) -> u32 {
         if self.cache.ui_scale == 0 {
-            100
+            if cfg!(target_os = "macos") {
+                110
+            } else {
+                100
+            }
         } else {
             self.cache.ui_scale
         }
@@ -980,5 +1067,26 @@ mod tests {
         let _ = std::fs::remove_file(&export_path);
         let _ = std::fs::remove_file(&a.path);
         let _ = std::fs::remove_file(&b.path);
+    }
+
+    #[test]
+    fn legacy_session_gets_safe_ssh_policy_defaults() {
+        let session: Session = serde_json::from_str(
+            r#"{
+                "id":"old",
+                "name":"legacy",
+                "host":"example.test",
+                "port":22,
+                "user":"root",
+                "auth":"password"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(session.host_key_policy, HostKeyPolicy::Ask);
+        assert_eq!(session.connect_timeout_secs, 15);
+        assert_eq!(session.keepalive_interval_secs, 30);
+        assert_eq!(session.keepalive_max, 3);
+        assert!(session.jump_session_id.is_empty());
+        assert!(session.jump_session.is_none());
     }
 }

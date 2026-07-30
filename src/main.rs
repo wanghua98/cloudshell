@@ -9,7 +9,9 @@ mod errlog;
 mod forward;
 mod i18n;
 mod known_hosts;
+mod ppk;
 mod proxy;
+mod remote_system;
 mod serial;
 mod sftp;
 mod ssh;
@@ -29,7 +31,10 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // macOS renderer is left at Slint's default (femtovg) and is NOT forced.
+    // Slint's backend selector prefers Skia when that optional renderer is
+    // compiled in. On macOS this made an idle window grow to ~480 MiB physical
+    // footprint, while the same UI under femtovg stayed near ~120 MiB. Select
+    // femtovg explicitly as the hardware-accelerated, low-memory default.
     //
     // History: 0.4.10 force-set SLINT_BACKEND=winit-skia to work around femtovg's
     // CoreText font lookup failing on macOS 26 / Tahoe (all text vanished, #108).
@@ -38,12 +43,16 @@ fn main() -> anyhow::Result<()> {
     // "PingFang SC" UI font and all text vanished there instead (#129). Icons
     // survived in both cases because Material Icons is an embedded font.
     //
-    // Neither renderer works for every macOS machine, so we no longer pick for the
-    // user: femtovg is the known-good default for the majority. Users for whom
-    // femtovg fails to render text (e.g. #108) can opt into Skia at launch with
+    // Neither renderer works for every macOS machine, so an explicit user
+    // setting always wins. Users for whom femtovg fails to render text (e.g.
+    // #108) can opt into Skia at launch with
     //     SLINT_BACKEND=winit-skia
     // The renderer-skia feature is still compiled in on macOS (see Cargo.toml) so
     // that override is available without a rebuild.
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("SLINT_BACKEND").is_none() {
+        std::env::set_var("SLINT_BACKEND", "winit-femtovg");
+    }
 
     init_tracing();
 

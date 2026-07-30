@@ -10,7 +10,7 @@ Cloudshell is built with Rust and [Slint](https://slint.dev). It brings tabbed t
 
 - **Native and lightweight** — a Rust binary with no garbage collector, designed for keeping several connections open.
 - **One remote-work workspace** — terminal, SFTP, resource panels, and session management stay together.
-- **Works with your SSH setup** — password, private-key, encrypted-key, and `~/.ssh/config` workflows are supported.
+- **Works with your SSH setup** — password, OpenSSH/PEM/PPK keys, jump hosts, and `~/.ssh/config` workflows are supported.
 - **Cross-platform** — builds are available for Windows, Linux, and macOS.
 
 ## Highlights
@@ -21,10 +21,10 @@ Cloudshell is built with Rust and [Slint](https://slint.dev). It brings tabbed t
 | Session management | Create, edit, delete, group, duplicate, import, and export connections. |
 | SFTP & transfer | Browse remote files, upload/download, drag-and-drop transfer, and in-terminal ZMODEM (`sz`) receive. |
 | Monitoring | Local and remote CPU, memory, swap, network, disk, process, and system information. |
-| Connectivity | SSH password/private-key authentication, serial and Telnet sessions, SOCKS5/HTTP outbound proxies. |
+| Connectivity | SSH password/private-key authentication (including encrypted PPK v2/v3), single-hop jump hosts, serial and Telnet sessions, and SOCKS5/HTTP outbound proxies. |
 | Tunnels | Local (`-L`), remote (`-R`), and dynamic SOCKS5 (`-D`) forwarding. |
 | Productivity | Quick commands, command history, and synchronized input to all online sessions. |
-| Security | First-use host-key confirmation, changed-key warnings, and ChaCha20-Poly1305 encrypted saved passwords. |
+| Security | Ask/strict/accept-new host-key policies, real-authentication connection tests, and ChaCha20-Poly1305 encrypted saved passwords. |
 
 ## Install
 
@@ -80,9 +80,10 @@ Host production
   User deploy
   Port 2222
   IdentityFile ~/.ssh/id_ed25519
+  ProxyJump bastion
 ```
 
-- Supported: `Host`, `HostName`, `User`, `Port`, and `IdentityFile`.
+- Supported: `Host`, `HostName`, `User`, `Port`, `IdentityFile`, and single-hop `ProxyJump`.
 - Wildcard rules such as `Host *`, along with unsupported OpenSSH directives, are not imported.
 - Existing aliases and entries with the same host + user are skipped. A missing user defaults to `root`.
 - Importing only creates or supplements Cloudshell sessions; it never changes `~/.ssh/config`.

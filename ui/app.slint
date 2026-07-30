@@ -23,9 +23,15 @@ import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
+import {
+    SystemInfoView, SystemInfoPage, SystemNetworkRow, SystemFilesystemRow
+} from "system_info.slint";
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, PortFwd }
+export {
+    SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, PortFwd,
+    SystemInfoPage, SystemNetworkRow, SystemFilesystemRow
+}
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -220,9 +226,11 @@ export component AppWindow inherits Window {
     in property <[string]> net-ifaces;      // remote NIC names for the selector
     in property <string> net-selected;      // currently selected NIC
     in property <bool> net-show-selector;   // only on a live session tab
+    in property <bool> system-info-available; // live SSH source for the info page
     in property <[DiskInfo]> disks;         // active tab's filesystem usage
     in property <string> app-version;       // from Rust: env!("CARGO_PKG_VERSION")
     callback select-net-iface(string);
+    callback open-system-info();
 
     // --- Top-right popups --------------------------------------------------
     in-out property <bool> download-open: false;  // download manager popup
@@ -415,6 +423,7 @@ export component AppWindow inherits Window {
     // --- Tabs --------------------------------------------------------------
     in property <[TabInfo]> tabs;
     in-out property <string> active-tab-id: "welcome";
+    in property <[SystemInfoPage]> system-info-pages;
     in property <[TerminalState]> terminals;
 
     // --- Dialog state ------------------------------------------------------
@@ -439,6 +448,17 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-parity: "none";
     in-out property <string> dialog-flow: "none";
     in-out property <bool> dialog-disable-shell-integration: false;
+    in-out property <[string]> dialog-jump-options;
+    in-out property <string> dialog-jump-session;
+    in-out property <string> dialog-host-key-policy: "ask";
+    in-out property <string> dialog-connect-timeout: "15";
+    in-out property <string> dialog-keepalive-interval: "30";
+    in-out property <string> dialog-keepalive-max: "3";
+    in-out property <string> dialog-initial-directory;
+    in-out property <string> dialog-startup-command;
+    in-out property <bool> dialog-test-running: false;
+    in-out property <bool> dialog-test-ok: false;
+    in-out property <string> dialog-test-result;
 
     // Delete-confirmation modal state (#28).
     in-out property <bool> confirm-delete-open: false;
@@ -461,6 +481,7 @@ export component AppWindow inherits Window {
     callback session-dialog-submit(SessionDraft);
     callback session-dialog-cancel();
     callback session-dialog-pick-key();
+    callback session-dialog-test(SessionDraft);
     // Port forwards for the session being edited (#56).
     in-out property <[PortFwd]> dialog-forwards;
     callback add-forward(string /* name */, string /* kind */, string /* bind */, int /* port */,
@@ -470,10 +491,13 @@ export component AppWindow inherits Window {
     callback tab-selected(string);
     callback tab-closed(string);
     callback new-tab-clicked();
+    callback refresh-system-info(string /* page id */, string /* source terminal id */);
     // Asks Rust to recompute the sidebar (status + resources) for whatever tab
     // is now active.  Fired on every active-tab change, UI- or code-driven.
     callback refresh-sidebar();
     changed active-tab-id => { root.refresh-sidebar(); }
+    callback set-process-monitor-open(bool);
+    changed proc-open => { root.set-process-monitor-open(root.proc-open); }
 
     // Raw keystroke forwarding: Rust converts key+modifiers to PTY bytes.
     callback send-key(string /* tab-id */, string /* key */, bool /* ctrl */, bool /* alt */, bool /* shift */);
@@ -616,11 +640,13 @@ export component AppWindow inherits Window {
             net-ifaces: root.net-ifaces;
             net-selected: root.net-selected;
             net-show-selector: root.net-show-selector;
+            system-info-available: root.system-info-available;
             disks: root.disks;
             proc-available: root.proc-available;
             app-version: root.app-version;
             select-net-iface(i) => { root.select-net-iface(i); }
             show-processes() => { root.proc-open = true; }
+            show-system-info() => { root.open-system-info(); }
         }
 
         // Right side: tabs + content
@@ -813,6 +839,18 @@ export component AppWindow inherits Window {
                     select-update(r, c) => { root.term-select-update(term.id, r, c); }
                     select-end() => { root.term-select-end(term.id); }
                     select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
+                }
+
+                // One-shot system-information pages. They are lightweight
+                // snapshots associated with an existing SSH terminal.
+                for info in root.system-info-pages : SystemInfoView {
+                    visible: info.id == root.active-tab-id;
+                    width: info.id == root.active-tab-id ? parent.width : 0px;
+                    height: info.id == root.active-tab-id ? parent.height : 0px;
+                    page: info;
+                    refresh(page-id, source-id) => {
+                        root.refresh-system-info(page-id, source-id);
+                    }
                 }
             }
         }
@@ -1032,7 +1070,7 @@ export component AppWindow inherits Window {
                                 text: root.editor-name
                                     + (root.editor-readonly
                                         ? "  ·  " + @tr("Read-only")
-                                        : (root.editor-dirty ? "  ·  " + @tr("Modified") : ""));
+                                        : (root.editor-dirty ? "  ·  " + @tr("Unsaved changes") : ""));
                                 color: Theme.text-primary;
                                 font-size: Theme.fs-md;
                                 font-weight: 600;
@@ -1368,8 +1406,9 @@ export component AppWindow inherits Window {
         }
 
     // --- Process monitor popup (#23) --------------------------------------
-    // Read-only table of the remote machine's top processes by CPU. The data
-    // refreshes live every ~2s via the monitor channel while the popup is open.
+    // Read-only table of the remote machine's top processes by CPU. Opening the
+    // popup starts an on-demand monitor channel; closing it stops the remote
+    // `ps` loop. While open, the data still refreshes live every ~2s.
     if root.proc-open : TouchArea {
         width: parent.width;
         height: parent.height;
@@ -2951,8 +2990,20 @@ export component AppWindow inherits Window {
         draft-parity <=> root.dialog-parity;
         draft-flow <=> root.dialog-flow;
         draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
+        jump-options: root.dialog-jump-options;
+        draft-jump-session <=> root.dialog-jump-session;
+        draft-host-key-policy <=> root.dialog-host-key-policy;
+        draft-connect-timeout <=> root.dialog-connect-timeout;
+        draft-keepalive-interval <=> root.dialog-keepalive-interval;
+        draft-keepalive-max <=> root.dialog-keepalive-max;
+        draft-initial-directory <=> root.dialog-initial-directory;
+        draft-startup-command <=> root.dialog-startup-command;
+        test-running <=> root.dialog-test-running;
+        test-ok <=> root.dialog-test-ok;
+        test-result <=> root.dialog-test-result;
         forwards: root.dialog-forwards;
         submit(draft) => { root.session-dialog-submit(draft); }
+        test-connection(draft) => { root.session-dialog-test(draft); }
         cancel => { root.session-dialog-cancel(); }
         pick-key-file => { root.session-dialog-pick-key(); }
         add-forward(n, k, b, p, h, hp) => { root.add-forward(n, k, b, p, h, hp); }

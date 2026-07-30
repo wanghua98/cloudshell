@@ -43,7 +43,9 @@ export global Theme {
     // Terminal uses its own background so it stays readable regardless of
     // what the shell / remote app outputs via ANSI colour codes.
     out property <brush> term-bg: dark ? #0e0f13 : #fafafa;
-    out property <brush> term-fg: dark ? #d4d4d4 : #2d2d2f;
+    // A brighter dark-theme foreground preserves glyph edge contrast with
+    // grayscale GPU antialiasing (FemtoVG on macOS does not use LCD subpixels).
+    out property <brush> term-fg: dark ? #e5e5e5 : #2d2d2f;
 
     // Global UI scale (#100/#117/#118). Rust sets this from the saved setting;
     // all font sizes and spacing/radii below multiply by it, so the whole UI
@@ -69,7 +71,7 @@ export global Theme {
     // Terminal font — user-configurable via Interface settings, set by Rust
     // from the config on startup. cell size in terminal_view derives from these.
     in-out property <string> term-font-family: "Cloudshell Mono";
-    in-out property <length> term-font-size: 13px;
+    in-out property <length> term-font-size: 14px;
 
     // --- Geometry ----------------------------------------------------------
     out property <length> radius-sm: 4px * root.ui-scale;

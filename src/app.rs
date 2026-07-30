@@ -31,11 +31,12 @@ use i_slint_backend_winit::WinitWindowAccessor;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Runtime;
 
-use crate::config::{AuthMethod, ConfigStore, Secret, Session, SessionKind};
+use crate::config::{AuthMethod, ConfigStore, HostKeyPolicy, Secret, Session, SessionKind};
 use crate::i18n::t;
 use crate::sftp::spawn_sftp;
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, SessionCommand, SessionEvent, SessionHandle,
+    format_mtime, format_size, spawn_session, test_connection, SessionCommand, SessionEvent,
+    SessionHandle,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
 
@@ -256,11 +257,11 @@ pub fn run() -> Result<()> {
     // embedded font. Instead probe what fontdb actually loaded and pick the first
     // resolvable CJK family, falling back to the embedded "Cloudshell Mono" so the
     // window is never fully blank even when the system font DB is unreadable.
-    window.set_ui_font_family(resolve_ui_font_family());
-    // Populate the Interface font picker with installed monospace families.
-    window.set_term_fonts(ModelRc::from(Rc::new(VecModel::from(
-        system_monospace_fonts(),
-    ))));
+    // One fontdb scan supplies both the UI fallback and terminal font picker.
+    // Loading the complete system font catalog twice is expensive on macOS.
+    let (ui_font_family, terminal_fonts) = system_font_catalog();
+    window.set_ui_font_family(ui_font_family);
+    window.set_term_fonts(ModelRc::from(Rc::new(VecModel::from(terminal_fonts))));
 
     // Command bar (#55): seed quick commands + history from the config. Groups
     // start collapsed by default (#55).
@@ -435,6 +436,7 @@ pub fn run() -> Result<()> {
         id: "welcome".into(),
         title: t("新标签页", "New tab").into(),
         kind: "welcome".into(),
+        source_id: "".into(),
         connected: false,
     });
     window.set_tabs(ModelRc::from(tabs_model.clone()));
@@ -442,6 +444,8 @@ pub fn run() -> Result<()> {
 
     let terminals_model: Rc<VecModel<TerminalState>> = Rc::new(VecModel::default());
     window.set_terminals(ModelRc::from(terminals_model.clone()));
+    let system_info_model: Rc<VecModel<SystemInfoPage>> = Rc::new(VecModel::default());
+    window.set_system_info_pages(ModelRc::from(system_info_model.clone()));
 
     // Per-tab connection status + remote resources, the latest local sample,
     // and the local machine's network history (bottom sparkline).
@@ -475,9 +479,32 @@ pub fn run() -> Result<()> {
         let statuses = tab_statuses.clone();
         let local = local_snap.clone();
         let net = local_net_hist.clone();
+        let process_handles = handles.clone();
         window.on_refresh_sidebar(move || {
             if let Some(w) = weak.upgrade() {
+                // A tab switch while the process popup is open moves the
+                // on-demand sampler to the newly active SSH session.
+                if w.get_proc_open() {
+                    let active = source_terminal_id(&w, w.get_active_tab_id().as_str());
+                    for (id, handle) in process_handles.borrow().iter() {
+                        handle.set_process_monitor(id == &active);
+                    }
+                }
                 refresh_sidebar(&w, &statuses, &local, &net);
+            }
+        });
+    }
+
+    // The remote `ps --sort` loop is intentionally demand-driven. It is useful
+    // in the process popup but pure overhead for an ordinary connected shell.
+    {
+        let weak = window.as_weak();
+        let process_handles = handles.clone();
+        window.on_set_process_monitor_open(move |enabled| {
+            let Some(w) = weak.upgrade() else { return };
+            let active = source_terminal_id(&w, w.get_active_tab_id().as_str());
+            for (id, handle) in process_handles.borrow().iter() {
+                handle.set_process_monitor(enabled && id == &active);
             }
         });
     }
@@ -592,7 +619,7 @@ pub fn run() -> Result<()> {
         let net = local_net_hist.clone();
         window.on_select_net_iface(move |iface: SharedString| {
             let Some(w) = weak.upgrade() else { return };
-            let active = w.get_active_tab_id().to_string();
+            let active = source_terminal_id(&w, w.get_active_tab_id().as_str());
             if let Some(st) = statuses.lock().unwrap().get_mut(&active) {
                 st.selected_iface = iface.to_string();
                 st.net_hist = vec![0.0; NET_HISTORY_LEN]; // reset graph for new NIC
@@ -777,12 +804,21 @@ pub fn run() -> Result<()> {
 
     wire_tab_callbacks(
         &window,
-        tabs_model.clone(),
-        terminals_model.clone(),
+        TabModels {
+            tabs: tabs_model.clone(),
+            terminals: terminals_model.clone(),
+            system_info: system_info_model.clone(),
+        },
         handles.clone(),
         bufs.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
+    );
+    wire_system_info_callbacks(
+        &window,
+        tabs_model.clone(),
+        system_info_model,
+        handles.clone(),
     );
     wire_sftp_callbacks(&window, sftp_handles.clone(), sftp_last_cwd.clone());
     wire_key_input(
@@ -1301,6 +1337,61 @@ struct SessionCallbackCtx {
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
 }
 
+fn resolve_jump_session(store: &ConfigStore, session: &mut Session) -> Result<()> {
+    session.jump_session = None;
+    if session.jump_session_id.is_empty() {
+        return Ok(());
+    }
+    if session.jump_session_id == session.id {
+        anyhow::bail!("a session cannot use itself as its jump host");
+    }
+    let mut jump = store
+        .get(&session.jump_session_id)
+        .cloned()
+        .context("configured jump-host session no longer exists")?;
+    if jump.kind != SessionKind::Ssh {
+        anyhow::bail!("jump host must be an SSH session");
+    }
+    if !jump.jump_session_id.is_empty() {
+        anyhow::bail!("nested jump hosts are not supported");
+    }
+    jump.jump_session = None;
+    session.jump_session = Some(Box::new(jump));
+    Ok(())
+}
+
+fn jump_choices(store: &ConfigStore, current_id: &str) -> Vec<(String, String)> {
+    let mut choices = vec![(
+        t("直连（不使用跳板）", "Direct (no jump host)").to_string(),
+        String::new(),
+    )];
+    choices.extend(
+        store
+            .sessions()
+            .iter()
+            .filter(|candidate| candidate.kind == SessionKind::Ssh && candidate.id != current_id)
+            .map(|candidate| {
+                (
+                    format!(
+                        "{} — {}@{}:{}",
+                        candidate.name, candidate.user, candidate.host, candidate.port
+                    ),
+                    candidate.id.clone(),
+                )
+            }),
+    );
+    choices
+}
+
+fn jump_choice_model(choices: &[(String, String)]) -> ModelRc<SharedString> {
+    ModelRc::from(Rc::new(VecModel::from(
+        choices
+            .iter()
+            .map(|(label, _)| SharedString::from(label.as_str()))
+            .collect::<Vec<_>>(),
+    )))
+}
+
 fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
     let store = ctx.store.clone();
     let sessions_model = ctx.sessions_model.clone();
@@ -1321,16 +1412,20 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
     // Session.forwards; opening the dialog (new/edit) resets it.
     let edit_forwards: Rc<RefCell<Vec<crate::config::PortForward>>> =
         Rc::new(RefCell::new(Vec::new()));
+    // Display-label → stable saved-session id mapping for the jump-host combo.
+    let edit_jump_choices: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
 
     // New session -> open dialog with blank draft.
     let weak = window.as_weak();
     let ef_new = edit_forwards.clone();
+    let jump_new = edit_jump_choices.clone();
+    let store_new = store.clone();
     window.on_new_session_clicked(move || {
         if let Some(w) = weak.upgrade() {
             ef_new.borrow_mut().clear();
             w.set_dialog_forwards(forward_model(&[]));
             let empty = Session::new_empty();
-            w.set_dialog_id(empty.id.into());
+            w.set_dialog_id(empty.id.clone().into());
             w.set_dialog_name("".into());
             w.set_dialog_host("".into());
             w.set_dialog_port("22".into());
@@ -1351,6 +1446,19 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
             w.set_dialog_disable_shell_integration(false);
+            let choices = jump_choices(&store_new.borrow(), empty.id.as_str());
+            w.set_dialog_jump_options(jump_choice_model(&choices));
+            w.set_dialog_jump_session(choices[0].0.clone().into());
+            *jump_new.borrow_mut() = choices;
+            w.set_dialog_host_key_policy("ask".into());
+            w.set_dialog_connect_timeout("15".into());
+            w.set_dialog_keepalive_interval("30".into());
+            w.set_dialog_keepalive_max("3".into());
+            w.set_dialog_initial_directory("".into());
+            w.set_dialog_startup_command("".into());
+            w.set_dialog_test_running(false);
+            w.set_dialog_test_ok(false);
+            w.set_dialog_test_result("".into());
             w.set_dialog_editing(false);
             w.set_dialog_open(true);
         }
@@ -1374,7 +1482,7 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
             }
             {
                 let mut s = store.borrow_mut();
-                for h in hosts {
+                for h in &hosts {
                     // Skip if a session already has this alias, or the same
                     // host + user pair.
                     let dup = s
@@ -1390,19 +1498,44 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                         AuthMethod::Key
                     };
                     s.upsert(Session {
-                        name: h.alias,
-                        host: h.hostname,
+                        name: h.alias.clone(),
+                        host: h.hostname.clone(),
                         port: h.port,
                         user: if h.user.is_empty() {
                             "root".into()
                         } else {
-                            h.user
+                            h.user.clone()
                         },
                         auth,
-                        private_key_path: h.identity_file,
+                        private_key_path: h.identity_file.clone(),
                         ..Session::new_empty()
                     });
                     added += 1;
+                }
+                // Resolve ProxyJump aliases only after every imported Host block
+                // exists, so forward references work just like OpenSSH config.
+                for imported in hosts.iter().filter(|host| !host.proxy_jump.is_empty()) {
+                    let target_id = s
+                        .sessions()
+                        .iter()
+                        .find(|saved| {
+                            saved.name == imported.alias
+                                || (saved.host == imported.hostname && saved.user == imported.user)
+                        })
+                        .map(|saved| saved.id.clone());
+                    let jump_id = s
+                        .sessions()
+                        .iter()
+                        .find(|saved| saved.name == imported.proxy_jump)
+                        .map(|saved| saved.id.clone());
+                    if let (Some(target_id), Some(jump_id)) = (target_id, jump_id) {
+                        if target_id != jump_id {
+                            if let Some(mut target) = s.get(&target_id).cloned() {
+                                target.jump_session_id = jump_id;
+                                s.upsert(target);
+                            }
+                        }
+                    }
                 }
                 if added > 0 {
                     let _ = s.save();
@@ -1479,6 +1612,7 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
         let weak = window.as_weak();
         let store = store.clone();
         let ef_edit = edit_forwards.clone();
+        let jump_edit = edit_jump_choices.clone();
         window.on_edit_session(move |id: SharedString| {
             let id = id.to_string();
             let store = store.borrow();
@@ -1510,6 +1644,24 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
+                let choices = jump_choices(&store, session.id.as_str());
+                let selected = choices
+                    .iter()
+                    .find(|(_, choice_id)| choice_id == &session.jump_session_id)
+                    .map(|(label, _)| label.clone())
+                    .unwrap_or_else(|| choices[0].0.clone());
+                w.set_dialog_jump_options(jump_choice_model(&choices));
+                w.set_dialog_jump_session(selected.into());
+                *jump_edit.borrow_mut() = choices;
+                w.set_dialog_host_key_policy(session.host_key_policy.as_str().into());
+                w.set_dialog_connect_timeout(session.connect_timeout_secs.to_string().into());
+                w.set_dialog_keepalive_interval(session.keepalive_interval_secs.to_string().into());
+                w.set_dialog_keepalive_max(session.keepalive_max.to_string().into());
+                w.set_dialog_initial_directory(session.initial_directory.clone().into());
+                w.set_dialog_startup_command(session.startup_command.clone().into());
+                w.set_dialog_test_running(false);
+                w.set_dialog_test_ok(false);
+                w.set_dialog_test_result("".into());
                 w.set_dialog_editing(true);
                 w.set_dialog_open(true);
             }
@@ -1675,6 +1827,7 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         let edit_forwards = edit_forwards.clone();
+        let jump_submit = edit_jump_choices.clone();
         window.on_session_dialog_submit(move |draft: SessionDraft| {
             let id = draft.id.to_string();
             // The edit dialog never echoes the real password (issue #10): a blank
@@ -1739,6 +1892,23 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                 flow_control: draft.flow_control.to_string(),
                 forwards: edit_forwards.borrow().clone(),
                 disable_shell_integration: draft.disable_shell_integration,
+                jump_session_id: jump_submit
+                    .borrow()
+                    .iter()
+                    .find(|(label, _)| label == draft.jump_session.as_str())
+                    .map(|(_, id)| id.clone())
+                    .unwrap_or_default(),
+                jump_session: None,
+                host_key_policy: HostKeyPolicy::from_str(draft.host_key_policy.as_ref()),
+                connect_timeout_secs: if draft.connect_timeout <= 0 {
+                    15
+                } else {
+                    draft.connect_timeout.min(u16::MAX.into()) as u16
+                },
+                keepalive_interval_secs: draft.keepalive_interval.clamp(0, u16::MAX.into()) as u16,
+                keepalive_max: draft.keepalive_max.clamp(0, u8::MAX.into()) as u8,
+                initial_directory: draft.initial_directory.to_string(),
+                startup_command: draft.startup_command.to_string(),
             };
             {
                 let mut s = store.borrow_mut();
@@ -1751,6 +1921,132 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
             if let Some(w) = weak.upgrade() {
                 w.set_dialog_open(false);
             }
+        });
+    }
+
+    // Connection test: perform the same proxy/jump/host-key/authentication
+    // pipeline as a real terminal, then prove that a session channel can open.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let runtime = runtime.clone();
+        let jump_test = edit_jump_choices.clone();
+        window.on_session_dialog_test(move |draft: SessionDraft| {
+            let id = draft.id.to_string();
+            let password = if draft.password.is_empty() {
+                store
+                    .borrow()
+                    .get(&id)
+                    .map(|saved| saved.password.clone())
+                    .unwrap_or_default()
+            } else {
+                Secret::new(draft.password.to_string())
+            };
+            let mut session = Session {
+                id,
+                name: draft.name.to_string(),
+                host: draft.host.to_string(),
+                port: if draft.port <= 0 {
+                    22
+                } else {
+                    draft.port.min(u16::MAX.into()) as u16
+                },
+                user: draft.user.to_string(),
+                auth: AuthMethod::from_str(draft.auth.as_ref()),
+                password,
+                private_key_path: draft.private_key_path.to_string().replace('\\', "/"),
+                proxy: draft.proxy.to_string(),
+                jump_session_id: jump_test
+                    .borrow()
+                    .iter()
+                    .find(|(label, _)| label == draft.jump_session.as_str())
+                    .map(|(_, choice_id)| choice_id.clone())
+                    .unwrap_or_default(),
+                host_key_policy: HostKeyPolicy::from_str(draft.host_key_policy.as_ref()),
+                connect_timeout_secs: if draft.connect_timeout <= 0 {
+                    15
+                } else {
+                    draft.connect_timeout.min(u16::MAX.into()) as u16
+                },
+                keepalive_interval_secs: draft.keepalive_interval.clamp(0, u16::MAX.into()) as u16,
+                keepalive_max: draft.keepalive_max.clamp(0, u8::MAX.into()) as u8,
+                initial_directory: draft.initial_directory.to_string(),
+                startup_command: draft.startup_command.to_string(),
+                ..Session::new_empty()
+            };
+
+            if let Some(w) = weak.upgrade() {
+                w.set_dialog_test_running(true);
+                w.set_dialog_test_ok(false);
+                w.set_dialog_test_result(
+                    t("正在进行真实认证…", "Testing real authentication…").into(),
+                );
+            }
+            if let Err(error) = resolve_jump_session(&store.borrow(), &mut session) {
+                if let Some(w) = weak.upgrade() {
+                    w.set_dialog_test_running(false);
+                    w.set_dialog_test_result(format!("{error:#}").into());
+                }
+                return;
+            }
+
+            let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+            runtime.spawn(test_connection(session, events));
+            let weak_events = weak.clone();
+            std::thread::spawn(move || {
+                while let Some(event) = event_rx.blocking_recv() {
+                    let done = matches!(event, SessionEvent::ConnectionTestResult { .. });
+                    let weak_event = weak_events.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(window) = weak_event.upgrade() else {
+                            return;
+                        };
+                        match event {
+                            SessionEvent::HostKeyPrompt {
+                                host,
+                                port,
+                                key_type,
+                                fingerprint,
+                                changed,
+                                responder,
+                            } => enqueue_hostkey_prompt(
+                                &window,
+                                host,
+                                port,
+                                key_type,
+                                fingerprint,
+                                changed,
+                                responder,
+                            ),
+                            SessionEvent::CredentialPrompt {
+                                session_id,
+                                host,
+                                user,
+                                need_user,
+                                need_password,
+                                responder,
+                            } => enqueue_cred_prompt(
+                                &window,
+                                session_id,
+                                host,
+                                user,
+                                need_user,
+                                need_password,
+                                responder,
+                            ),
+                            SessionEvent::ConnectionTestResult { ok, message } => {
+                                window.set_dialog_test_running(false);
+                                window.set_dialog_test_ok(ok);
+                                window.set_dialog_test_result(message.into());
+                            }
+                            _ => {}
+                        }
+                    });
+                    if done {
+                        break;
+                    }
+                }
+            });
         });
     }
 
@@ -1855,10 +2151,19 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
         let sftp_follow_cd = sftp_follow_cd.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
-            let session = match store.borrow().get(&id).cloned() {
+            let mut session = match store.borrow().get(&id).cloned() {
                 Some(s) => s,
                 None => return,
             };
+            if let Err(error) = resolve_jump_session(&store.borrow(), &mut session) {
+                tracing::warn!("cannot resolve jump host: {error:#}");
+                if let Some(w) = weak.upgrade() {
+                    w.set_ssh_import_hint(
+                        format!("{}: {error:#}", t("连接失败", "Connect failed")).into(),
+                    );
+                }
+                return;
+            }
             let tab_id = format!("term-{}", uuid::Uuid::new_v4());
             let tab_title = session.name.clone();
 
@@ -1882,6 +2187,7 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                     host: conn_label.clone(),
                     session_id: id.clone(),
                     state: 0,
+                    remote_tools: has_sftp,
                     ..Default::default()
                 },
             );
@@ -1891,6 +2197,7 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                 id: tab_id.clone().into(),
                 title: tab_title.into(),
                 kind: "terminal".into(),
+                source_id: "".into(),
                 connected: false,
             });
             terminals_model.push(TerminalState {
@@ -2247,6 +2554,126 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     });
 }
 
+fn empty_system_info_page(id: &str, source_id: &str, source_title: &str) -> SystemInfoPage {
+    SystemInfoPage {
+        id: id.into(),
+        source_tab_id: source_id.into(),
+        source_title: source_title.into(),
+        loading: true,
+        error: "".into(),
+        operating_system: "".into(),
+        kernel: "".into(),
+        kernel_version: "".into(),
+        architecture: "".into(),
+        hostname: "".into(),
+        cpu_name: "".into(),
+        cpu_cores: "".into(),
+        cpu_frequency: "".into(),
+        cpu_cache: "".into(),
+        bogomips: "".into(),
+        cpu_user: "".into(),
+        cpu_system: "".into(),
+        cpu_nice: "".into(),
+        cpu_idle: "".into(),
+        cpu_io: "".into(),
+        cpu_hard_irq: "".into(),
+        cpu_soft_irq: "".into(),
+        cpu_steal: "".into(),
+        memory_total: "".into(),
+        memory_used: "".into(),
+        memory_percent: "".into(),
+        memory_free: "".into(),
+        swap_total: "".into(),
+        swap_used: "".into(),
+        swap_percent: "".into(),
+        swap_free: "".into(),
+        networks: ModelRc::from(Rc::new(VecModel::<SystemNetworkRow>::default())),
+        filesystems: ModelRc::from(Rc::new(VecModel::<SystemFilesystemRow>::default())),
+    }
+}
+
+fn apply_system_info_snapshot(
+    page: &mut SystemInfoPage,
+    info: &crate::remote_system::SystemInfoSnapshot,
+) {
+    let pct = |used: u64, total: u64| {
+        if total == 0 {
+            "—".to_string()
+        } else {
+            format!("{:.1}%", used as f64 * 100.0 / total as f64)
+        }
+    };
+    let bytes_from_kib = |kib: u64| kib.saturating_mul(1024);
+    let cpu_pct = |value: f32| format!("{value:.1}%");
+
+    page.loading = false;
+    page.error = "".into();
+    page.operating_system = info.os.clone().into();
+    page.kernel = info.kernel.clone().into();
+    page.kernel_version = info.kernel_version.clone().into();
+    page.architecture = info.architecture.clone().into();
+    page.hostname = info.hostname.clone().into();
+    page.cpu_name = info.cpu_name.clone().into();
+    page.cpu_cores = if info.cpu_cores == 0 {
+        "".into()
+    } else {
+        info.cpu_cores.to_string().into()
+    };
+    page.cpu_frequency = if info.cpu_mhz.is_empty() {
+        "".into()
+    } else {
+        format!("{} MHz", info.cpu_mhz).into()
+    };
+    page.cpu_cache = info.cpu_cache.clone().into();
+    page.bogomips = info.bogomips.clone().into();
+    page.cpu_user = cpu_pct(info.cpu.user).into();
+    page.cpu_system = cpu_pct(info.cpu.system).into();
+    page.cpu_nice = cpu_pct(info.cpu.nice).into();
+    page.cpu_idle = cpu_pct(info.cpu.idle).into();
+    page.cpu_io = cpu_pct(info.cpu.io_wait).into();
+    page.cpu_hard_irq = cpu_pct(info.cpu.hard_irq).into();
+    page.cpu_soft_irq = cpu_pct(info.cpu.soft_irq).into();
+    page.cpu_steal = cpu_pct(info.cpu.steal).into();
+
+    let mem_free = info.mem_total_kib.saturating_sub(info.mem_used_kib);
+    page.memory_total = format_size(bytes_from_kib(info.mem_total_kib)).into();
+    page.memory_used = format_size(bytes_from_kib(info.mem_used_kib)).into();
+    page.memory_percent = pct(info.mem_used_kib, info.mem_total_kib).into();
+    page.memory_free = format_size(bytes_from_kib(mem_free)).into();
+    let swap_free = info.swap_total_kib.saturating_sub(info.swap_used_kib);
+    page.swap_total = format_size(bytes_from_kib(info.swap_total_kib)).into();
+    page.swap_used = format_size(bytes_from_kib(info.swap_used_kib)).into();
+    page.swap_percent = pct(info.swap_used_kib, info.swap_total_kib).into();
+    page.swap_free = format_size(bytes_from_kib(swap_free)).into();
+
+    let networks: Vec<SystemNetworkRow> = info
+        .networks
+        .iter()
+        .map(|network| SystemNetworkRow {
+            name: network.name.clone().into(),
+            sent: format_size(network.tx_total).into(),
+            received: format_size(network.rx_total).into(),
+            send_rate: format_bytes_per_sec(network.tx_per_sec).into(),
+            receive_rate: format_bytes_per_sec(network.rx_per_sec).into(),
+        })
+        .collect();
+    page.networks = ModelRc::from(Rc::new(VecModel::from(networks)));
+
+    let filesystems: Vec<SystemFilesystemRow> = info
+        .filesystems
+        .iter()
+        .map(|filesystem| SystemFilesystemRow {
+            name: filesystem.name.clone().into(),
+            size: format_size(filesystem.total).into(),
+            used: format_size(filesystem.used).into(),
+            percent: filesystem.percent.clone().into(),
+            available: format_size(filesystem.available).into(),
+            mount_point: filesystem.mount_point.clone().into(),
+        })
+        .collect();
+    page.filesystems = ModelRc::from(Rc::new(VecModel::from(filesystems)));
+}
+
 /// Resolve which interface drives the top sparkline: the user's selection if it
 /// still exists, otherwise the busiest (the list is sorted busiest-first).
 /// Returns (name, rx_bps, tx_bps).
@@ -2257,6 +2684,26 @@ fn selected_iface(st: &TabStatus) -> (String, u64, u64) {
         }
     }
     st.net.first().cloned().unwrap_or_default()
+}
+
+/// Map a derived tab (currently system information) back to the SSH terminal
+/// whose connection and resource state it represents.
+fn source_terminal_id(win: &AppWindow, tab_id: &str) -> String {
+    let tabs_rc = win.get_tabs();
+    let Some(tabs) = tabs_rc.as_any().downcast_ref::<VecModel<TabInfo>>() else {
+        return tab_id.to_string();
+    };
+    for i in 0..tabs.row_count() {
+        if let Some(row) = tabs.row_data(i) {
+            if row.id.as_str() == tab_id
+                && row.kind.as_str() == "system-info"
+                && !row.source_id.is_empty()
+            {
+                return row.source_id.to_string();
+            }
+        }
+    }
+    tab_id.to_string()
 }
 
 /// Recompute the whole sidebar (status dot + CPU/mem/swap + dual network panel)
@@ -2310,15 +2757,17 @@ fn refresh_sidebar(
     };
 
     // Process monitor (#23) only applies to a live remote session; default to
-    // hidden/empty and let the connected branch below fill it in.
+    // hidden and let the connected branch below enable it. Do not rebuild its
+    // model on every resource tick while the popup is closed.
     win.set_proc_available(false);
-    win.set_proc_list(ModelRc::from(Rc::new(VecModel::<ProcRow>::default())));
+    win.set_system_info_available(false);
 
     let active = win.get_active_tab_id().to_string();
-    let status = if active == "welcome" {
+    let source_id = source_terminal_id(win, &active);
+    let status = if source_id == "welcome" {
         None
     } else {
-        statuses.lock().unwrap().get(&active).cloned()
+        statuses.lock().unwrap().get(&source_id).cloned()
     };
 
     match status {
@@ -2343,8 +2792,11 @@ fn refresh_sidebar(
             let ifaces: Vec<SharedString> = st.net.iter().map(|e| e.0.clone().into()).collect();
             win.set_net_ifaces(ModelRc::from(Rc::new(VecModel::from(ifaces))));
             win.set_disks(disk_model(&st.disks));
-            win.set_proc_available(true);
-            win.set_proc_list(proc_model(&st.procs));
+            win.set_proc_available(st.remote_tools);
+            win.set_system_info_available(st.remote_tools);
+            if win.get_proc_open() {
+                win.set_proc_list(proc_model(&st.procs));
+            }
         }
         // Disconnected / timed-out session.
         Some(st) if st.state == 2 => {
@@ -2417,6 +2869,16 @@ fn apply_session_event_to_window(
             }
         }
     };
+    let update_derived_tabs = |mutator: &dyn Fn(&mut TabInfo)| {
+        for i in 0..tabs.row_count() {
+            if let Some(mut row) = tabs.row_data(i) {
+                if row.source_id.as_str() == tab_id {
+                    mutator(&mut row);
+                    tabs.set_row_data(i, row);
+                }
+            }
+        }
+    };
 
     match event {
         SessionEvent::Status(status) => {
@@ -2468,11 +2930,12 @@ fn apply_session_event_to_window(
         }
         SessionEvent::Connected => {
             update_tab(&|t| t.connected = true);
+            update_derived_tabs(&|t| t.connected = true);
             update_terminal(&|t| t.status = crate::i18n::t("已连接", "Connected").into());
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 1;
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if source_terminal_id(win, win.get_active_tab_id().as_str()) == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -2498,13 +2961,14 @@ fn apply_session_event_to_window(
                 local_net_hist,
             );
             update_tab(&|t| t.connected = false);
+            update_derived_tabs(&|t| t.connected = false);
             update_terminal(&|t| {
                 t.status = format!("{} — {reason}", crate::i18n::t("已断开", "Disconnected")).into()
             });
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 2;
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if source_terminal_id(win, win.get_active_tab_id().as_str()) == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
             }
         }
@@ -2516,7 +2980,6 @@ fn apply_session_event_to_window(
             swap_total_kib,
             net,
             disks,
-            procs,
         } => {
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.cpu = cpu_percent;
@@ -2525,8 +2988,11 @@ fn apply_session_event_to_window(
                 st.swap_used_kib = swap_used_kib;
                 st.swap_total_kib = swap_total_kib;
                 st.net = net;
-                st.disks = disks;
-                st.procs = procs;
+                // `df` is intentionally absent from most lightweight samples;
+                // retain the last filesystem snapshot until the next slow tick.
+                if !disks.is_empty() {
+                    st.disks = disks;
+                }
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;
@@ -2535,8 +3001,42 @@ fn apply_session_event_to_window(
                 let (_, rx, tx) = selected_iface(st);
                 push_ring(&mut st.net_hist, (rx + tx) as f32);
             }
-            if win.get_active_tab_id().as_str() == tab_id {
+            if source_terminal_id(win, win.get_active_tab_id().as_str()) == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
+            }
+        }
+        SessionEvent::ProcessStats(procs) => {
+            if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
+                st.procs = procs.clone();
+            }
+            if win.get_proc_open()
+                && source_terminal_id(win, win.get_active_tab_id().as_str()) == tab_id
+            {
+                win.set_proc_list(proc_model(&procs));
+            }
+        }
+        SessionEvent::SystemInfo {
+            page_id,
+            info,
+            error,
+        } => {
+            let pages_rc = win.get_system_info_pages();
+            if let Some(pages) = pages_rc.as_any().downcast_ref::<VecModel<SystemInfoPage>>() {
+                for i in 0..pages.row_count() {
+                    if let Some(mut page) = pages.row_data(i) {
+                        if page.id.as_str() != page_id {
+                            continue;
+                        }
+                        if let Some(ref snapshot) = info {
+                            apply_system_info_snapshot(&mut page, snapshot);
+                        } else {
+                            page.loading = false;
+                            page.error = error.clone().into();
+                        }
+                        pages.set_row_data(i, page);
+                        break;
+                    }
+                }
             }
         }
 
@@ -2731,6 +3231,10 @@ fn apply_session_event_to_window(
                 need_password,
                 responder,
             );
+        }
+        SessionEvent::ConnectionTestResult { .. } => {
+            // Dialog tests have a dedicated event pump and never enter a tab's
+            // terminal event stream.
         }
         SessionEvent::CommandRan(cmd) => {
             // A command typed directly in the terminal, captured via the shell
@@ -3040,15 +3544,118 @@ fn persist_credentials(
 // Tab callbacks
 // ---------------------------------------------------------------------------
 
-fn wire_tab_callbacks(
+fn request_system_info_page(
+    pages: &VecModel<SystemInfoPage>,
+    handles: &RefCell<HashMap<String, SessionHandle>>,
+    page_id: &str,
+    source_id: &str,
+) {
+    for i in 0..pages.row_count() {
+        if let Some(mut page) = pages.row_data(i) {
+            if page.id.as_str() == page_id {
+                page.loading = true;
+                page.error = "".into();
+                pages.set_row_data(i, page);
+                break;
+            }
+        }
+    }
+
+    let sent = handles
+        .borrow()
+        .get(source_id)
+        .is_some_and(|handle| handle.request_system_info(page_id.to_string()));
+    if !sent {
+        for i in 0..pages.row_count() {
+            if let Some(mut page) = pages.row_data(i) {
+                if page.id.as_str() == page_id {
+                    page.loading = false;
+                    page.error = t("SSH 会话已断开", "The SSH session is disconnected").into();
+                    pages.set_row_data(i, page);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn wire_system_info_callbacks(
     window: &AppWindow,
     tabs_model: Rc<VecModel<TabInfo>>,
-    terminals_model: Rc<VecModel<TerminalState>>,
+    pages: Rc<VecModel<SystemInfoPage>>,
+    handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
+) {
+    {
+        let weak = window.as_weak();
+        let tabs = tabs_model.clone();
+        let pages = pages.clone();
+        let handles = handles.clone();
+        window.on_open_system_info(move || {
+            let Some(win) = weak.upgrade() else { return };
+            let source_id = source_terminal_id(&win, win.get_active_tab_id().as_str());
+            if !handles.borrow().contains_key(&source_id) {
+                return;
+            }
+
+            let source_title = (0..tabs.row_count())
+                .filter_map(|i| tabs.row_data(i))
+                .find(|tab| tab.id.as_str() == source_id)
+                .map(|tab| tab.title.to_string())
+                .unwrap_or_else(|| source_id.clone());
+
+            let existing = (0..pages.row_count())
+                .filter_map(|i| pages.row_data(i))
+                .find(|page| page.source_tab_id.as_str() == source_id)
+                .map(|page| (page.id.to_string(), page.loading));
+
+            let (page_id, should_request) = if let Some((page_id, loading)) = existing {
+                (page_id, !loading)
+            } else {
+                let page_id = format!("sysinfo-{}", uuid::Uuid::new_v4());
+                tabs.push(TabInfo {
+                    id: page_id.clone().into(),
+                    title: format!("{} - {}", t("系统信息", "System info"), source_title).into(),
+                    kind: "system-info".into(),
+                    source_id: source_id.clone().into(),
+                    connected: true,
+                });
+                pages.push(empty_system_info_page(&page_id, &source_id, &source_title));
+                (page_id, true)
+            };
+
+            win.set_active_tab_id(page_id.clone().into());
+            if should_request {
+                request_system_info_page(&pages, &handles, &page_id, &source_id);
+            }
+        });
+    }
+
+    {
+        let pages = pages.clone();
+        let handles = handles.clone();
+        window.on_refresh_system_info(move |page_id: SharedString, source_id: SharedString| {
+            request_system_info_page(&pages, &handles, page_id.as_str(), source_id.as_str());
+        });
+    }
+}
+
+struct TabModels {
+    tabs: Rc<VecModel<TabInfo>>,
+    terminals: Rc<VecModel<TerminalState>>,
+    system_info: Rc<VecModel<SystemInfoPage>>,
+}
+
+fn wire_tab_callbacks(
+    window: &AppWindow,
+    models: TabModels,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
+    let tabs_model = models.tabs;
+    let terminals_model = models.terminals;
+    let system_info_model = models.system_info;
     // Selecting a tab is already applied inside the Slint callback; we just
     // need to keep the C++/Rust state in sync if needed.
     {
@@ -3061,6 +3668,7 @@ fn wire_tab_callbacks(
         let weak = window.as_weak();
         let tabs_model = tabs_model.clone();
         let terminals_model = terminals_model.clone();
+        let system_info_model = system_info_model.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
         let sftp_handles = sftp_handles.clone();
@@ -3069,6 +3677,32 @@ fn wire_tab_callbacks(
             let id = id.to_string();
             if id == "welcome" {
                 return;
+            }
+            let closing_tab = (0..tabs_model.row_count())
+                .filter_map(|i| tabs_model.row_data(i))
+                .find(|tab| tab.id.as_str() == id);
+            let fallback_id = closing_tab
+                .as_ref()
+                .filter(|tab| tab.kind.as_str() == "system-info")
+                .map(|tab| tab.source_id.to_string())
+                .filter(|source| {
+                    (0..tabs_model.row_count())
+                        .filter_map(|i| tabs_model.row_data(i))
+                        .any(|tab| tab.id.as_str() == source)
+                })
+                .unwrap_or_else(|| "welcome".to_string());
+
+            let mut remove_ids = vec![id.clone()];
+            if closing_tab
+                .as_ref()
+                .is_some_and(|tab| tab.kind.as_str() == "terminal")
+            {
+                remove_ids.extend(
+                    (0..tabs_model.row_count())
+                        .filter_map(|i| tabs_model.row_data(i))
+                        .filter(|tab| tab.source_id.as_str() == id)
+                        .map(|tab| tab.id.to_string()),
+                );
             }
             if let Some(handle) = handles.borrow_mut().remove(&id) {
                 handle.close();
@@ -3079,20 +3713,14 @@ fn wire_tab_callbacks(
             sftp_last_cwd.lock().unwrap().remove(&id);
             bufs.lock().unwrap().remove(&id);
 
-            // Remove from tabs + terminals models.
-            let mut idx = None;
-            for i in 0..tabs_model.row_count() {
+            // Remove the tab and any derived pages owned by a closing terminal.
+            for i in (0..tabs_model.row_count()).rev() {
                 if tabs_model
                     .row_data(i)
-                    .map(|r| r.id.as_str() == id)
-                    .unwrap_or(false)
+                    .is_some_and(|row| remove_ids.iter().any(|id| row.id.as_str() == id))
                 {
-                    idx = Some(i);
-                    break;
+                    tabs_model.remove(i);
                 }
-            }
-            if let Some(i) = idx {
-                tabs_model.remove(i);
             }
             let mut tidx = None;
             for i in 0..terminals_model.row_count() {
@@ -3108,11 +3736,22 @@ fn wire_tab_callbacks(
             if let Some(i) = tidx {
                 terminals_model.remove(i);
             }
+            for i in (0..system_info_model.row_count()).rev() {
+                if system_info_model
+                    .row_data(i)
+                    .is_some_and(|row| remove_ids.iter().any(|id| row.id.as_str() == id))
+                {
+                    system_info_model.remove(i);
+                }
+            }
 
             // If we closed the active tab, fall back to the welcome page.
             if let Some(w) = weak.upgrade() {
-                if w.get_active_tab_id().as_str() == id {
-                    w.set_active_tab_id("welcome".into());
+                if remove_ids
+                    .iter()
+                    .any(|id| w.get_active_tab_id().as_str() == id)
+                {
+                    w.set_active_tab_id(fallback_id.into());
                 }
             }
         });
@@ -4052,9 +4691,13 @@ fn wire_key_input(
                         .map(|st| st.session_id.clone())
                 };
                 if let Some(session_id) = dead_session {
-                    let Some(session) = store.borrow().get(&session_id).cloned() else {
+                    let Some(mut session) = store.borrow().get(&session_id).cloned() else {
                         return;
                     };
+                    if let Err(error) = resolve_jump_session(&store.borrow(), &mut session) {
+                        tracing::warn!("cannot resolve reconnect jump host: {error:#}");
+                        return;
+                    }
                     // Drop the dead shell/SFTP handles for this tab.
                     ctx.handles.borrow_mut().remove(tab_id.as_str());
                     if let Some(h) =
@@ -4770,8 +5413,16 @@ fn clipboard_set_text(text: String) {
 ///
 /// Emits a one-line WARN summary (faces loaded + chosen font) so the choice lands
 /// in `error.log` for diagnostics without needing RUST_LOG.
-fn resolve_ui_font_family() -> slint::SharedString {
-    use fontdb::{Database, Family, Query, Stretch, Style, Weight};
+fn system_font_catalog() -> (slint::SharedString, Vec<slint::SharedString>) {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    let ui_font = resolve_ui_font_family(&db);
+    let terminal_fonts = system_monospace_fonts(&db);
+    (ui_font, terminal_fonts)
+}
+
+fn resolve_ui_font_family(db: &fontdb::Database) -> slint::SharedString {
+    use fontdb::{Family, Query, Stretch, Style, Weight};
 
     // Diagnostic / escape hatch (#129): force a specific UI font without a rebuild.
     // e.g. CLOUDSHELL_UI_FONT="Cloudshell Mono" to test whether the embedded font
@@ -4784,8 +5435,6 @@ fn resolve_ui_font_family() -> slint::SharedString {
         }
     }
 
-    let mut db = Database::new();
-    db.load_system_fonts();
     let face_count = db.faces().count();
 
     // CJK-capable system families, most-preferred first, per platform. The UI
@@ -4855,9 +5504,7 @@ fn resolve_ui_font_family() -> slint::SharedString {
     "Cloudshell Mono".into()
 }
 
-fn system_monospace_fonts() -> Vec<slint::SharedString> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+fn system_monospace_fonts(db: &fontdb::Database) -> Vec<slint::SharedString> {
     let mut names: Vec<String> = db
         .faces()
         .filter(|f| f.monospaced)
@@ -5618,7 +6265,9 @@ fn vt_color_to_slint(color: vt100::Color, bold: bool, is_dark: bool) -> slint::C
     let (r, g, b) = match color {
         vt100::Color::Default => {
             if is_dark {
-                (0xd4, 0xd4, 0xd4)
+                // Match Theme.term-fg. The higher edge contrast makes small
+                // terminal glyphs clearer under FemtoVG's grayscale AA.
+                (0xe5, 0xe5, 0xe5)
             } else {
                 (0x2d, 0x2d, 0x2f)
             }

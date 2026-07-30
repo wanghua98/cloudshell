@@ -10,7 +10,7 @@ Cloudshell 使用 Rust 与 [Slint](https://slint.dev) 构建，提供多会话�
 
 - **原生且轻量**：Rust 二进制、无 GC，适合长期保持多个连接。
 - **一个工作区完成远程工作**：终端、SFTP、资源面板和会话管理无需在多个工具间切换。
-- **按你的 SSH 习惯工作**：支持密码、私钥、加密私钥和 `~/.ssh/config` 导入。
+- **按你的 SSH 习惯工作**：支持密码、OpenSSH/PEM/PPK 私钥、跳板连接和 `~/.ssh/config` 导入。
 - **跨平台**：提供 Windows、Linux 与 macOS 构建产物。
 
 ## 主要功能
@@ -21,10 +21,10 @@ Cloudshell 使用 Rust 与 [Slint](https://slint.dev) 构建，提供多会话�
 | 会话管理 | 创建、编辑、删除、分组、复制、导入和导出连接配置。 |
 | SFTP 与传输 | 浏览远端文件、上传下载、拖拽传输，以及终端内 ZMODEM（`sz`）接收。 |
 | 监控 | 查看本机与远端的 CPU、内存、交换、网络、磁盘、进程和系统信息。 |
-| 连接方式 | SSH 密码/私钥认证，串口和 Telnet 会话，SOCKS5/HTTP 出站代理。 |
+| 连接方式 | SSH 密码/私钥认证（含加密 PPK v2/v3）、单跳板连接、串口和 Telnet 会话、SOCKS5/HTTP 出站代理。 |
 | 隧道 | 本地转发（`-L`）、远程转发（`-R`）和动态 SOCKS5 转发（`-D`）。 |
 | 效率工具 | 快捷命令、命令历史，以及向全部在线会话广播输入。 |
-| 安全 | 首次连接时确认主机密钥；密钥变化会警告；会话密码以 ChaCha20-Poly1305 加密保存。 |
+| 安全 | 可选询问/严格/自动接受新主机密钥策略；连接测试执行真实认证；会话密码以 ChaCha20-Poly1305 加密保存。 |
 
 ## 安装
 
@@ -80,9 +80,10 @@ Host production
   User deploy
   Port 2222
   IdentityFile ~/.ssh/id_ed25519
+  ProxyJump bastion
 ```
 
-- 支持 `Host`、`HostName`、`User`、`Port`、`IdentityFile`。
+- 支持 `Host`、`HostName`、`User`、`Port`、`IdentityFile`、单跳 `ProxyJump`。
 - `Host *` 等通配规则和不支持的 OpenSSH 指令不会导入。
 - 重名，或“相同主机 + 相同用户”的会话会跳过；未设置用户时默认使用 `root`。
 - 导入只创建/补充 Cloudshell 会话，不会修改你的 `~/.ssh/config`。

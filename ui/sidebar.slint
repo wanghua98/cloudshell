@@ -210,6 +210,7 @@ export component Sidebar inherits Rectangle {
     in property <[string]> net-ifaces;
     in property <string> net-selected;
     in property <bool> net-show-selector;
+    in property <bool> system-info-available;
     in property <[DiskInfo]> disks;
     in property <bool> proc-available;   // a live remote session → show the process button (#23)
     // App version string, injected from Rust (env!("CARGO_PKG_VERSION")) so it
@@ -217,6 +218,7 @@ export component Sidebar inherits Rectangle {
     in property <string> app-version;
     callback select-net-iface(string);
     callback show-processes();           // open the process monitor popup (#23)
+    callback show-system-info();         // open a one-shot remote system-info tab
 
     width: 220px;
     background: Theme.bg-panel;
@@ -269,12 +271,25 @@ export component Sidebar inherits Rectangle {
         // when a connected session tab is active.
         HorizontalLayout {
             spacing: 6px;
-            Text {
-                text: root.resource-title;
-                color: Theme.text-secondary;
-                font-size: Theme.fs-sm;
-                vertical-alignment: center;
+            Rectangle {
                 horizontal-stretch: 1;
+                height: 20px;
+                border-radius: Theme.radius-sm;
+                background: root.system-info-available
+                    ? (sysinfo-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated)
+                    : transparent;
+                sysinfo-ta := TouchArea {
+                    enabled: root.system-info-available;
+                    mouse-cursor: self.enabled ? pointer : default;
+                    clicked => { root.show-system-info(); }
+                }
+                Text {
+                    text: root.system-info-available ? @tr("System information") : root.resource-title;
+                    color: root.system-info-available ? Theme.text-primary : Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                    horizontal-alignment: root.system-info-available ? center : left;
+                    vertical-alignment: center;
+                }
             }
             // Process monitor trigger — only on a live remote session (#23).
             if root.proc-available : Rectangle {

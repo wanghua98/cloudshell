@@ -1,0 +1,428 @@
+import { Theme } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export struct SystemNetworkRow {
+    name: string,
+    sent: string,
+    received: string,
+    send-rate: string,
+    receive-rate: string,
+}
+
+export struct SystemFilesystemRow {
+    name: string,
+    size: string,
+    used: string,
+    percent: string,
+    available: string,
+    mount-point: string,
+}
+
+export struct SystemInfoPage {
+    id: string,
+    source-tab-id: string,
+    source-title: string,
+    loading: bool,
+    error: string,
+    operating-system: string,
+    kernel: string,
+    kernel-version: string,
+    architecture: string,
+    hostname: string,
+    cpu-name: string,
+    cpu-cores: string,
+    cpu-frequency: string,
+    cpu-cache: string,
+    bogomips: string,
+    cpu-user: string,
+    cpu-system: string,
+    cpu-nice: string,
+    cpu-idle: string,
+    cpu-io: string,
+    cpu-hard-irq: string,
+    cpu-soft-irq: string,
+    cpu-steal: string,
+    memory-total: string,
+    memory-used: string,
+    memory-percent: string,
+    memory-free: string,
+    swap-total: string,
+    swap-used: string,
+    swap-percent: string,
+    swap-free: string,
+    networks: [SystemNetworkRow],
+    filesystems: [SystemFilesystemRow],
+}
+
+component LabelValue inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    height: 28px;
+    spacing: 16px;
+    Text {
+        width: 128px;
+        text: root.label;
+        color: Theme.text-muted;
+        font-size: Theme.fs-sm;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.value == "" ? "—" : root.value;
+        color: Theme.text-primary;
+        font-size: Theme.fs-sm;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        overflow: elide;
+    }
+}
+
+component SectionHeader inherits Rectangle {
+    in property <string> title;
+    height: 34px;
+    background: Theme.bg-panel-alt;
+    border-radius: Theme.radius-sm;
+    Text {
+        x: 12px;
+        width: parent.width - 24px;
+        text: root.title;
+        color: Theme.text-primary;
+        font-size: Theme.fs-md;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+}
+
+component Metric inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    horizontal-stretch: 1;
+    spacing: 3px;
+    Text {
+        text: root.label;
+        color: Theme.text-muted;
+        font-size: Theme.fs-xs;
+    }
+    Text {
+        text: root.value == "" ? "—" : root.value;
+        color: Theme.text-primary;
+        font-size: Theme.fs-sm;
+    }
+}
+
+component TableCell inherits Rectangle {
+    in property <string> text;
+    in property <brush> text-color: Theme.text-secondary;
+    in property <brush> cell-background: transparent;
+    height: 25px;
+    background: root.cell-background;
+    Text {
+        x: 8px;
+        width: parent.width - 16px;
+        text: root.text;
+        vertical-alignment: center;
+        horizontal-alignment: left;
+        color: root.text-color;
+        font-size: Theme.fs-xs;
+        overflow: elide;
+    }
+}
+
+export component SystemInfoView inherits Rectangle {
+    in property <SystemInfoPage> page;
+    callback refresh(string /* page id */, string /* source terminal id */);
+
+    background: Theme.bg-root;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            height: 34px;
+            spacing: 10px;
+            VerticalLayout {
+                spacing: 1px;
+                horizontal-stretch: 1;
+                Text {
+                    text: @tr("System information");
+                    color: Theme.text-primary;
+                    font-size: Theme.fs-lg;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.page.source-title;
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                }
+            }
+            Rectangle {
+                width: 84px;
+                height: 28px;
+                border-radius: Theme.radius-sm;
+                background: refresh-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated;
+                refresh-ta := TouchArea {
+                    enabled: !root.page.loading;
+                    mouse-cursor: self.enabled ? pointer : default;
+                    clicked => { root.refresh(root.page.id, root.page.source-tab-id); }
+                }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 5px;
+                    Text {
+                        text: "\u{E5D5}";
+                        font-family: "Material Icons";
+                        color: Theme.text-secondary;
+                        font-size: Theme.fs-md;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: @tr("Refresh");
+                        color: Theme.text-secondary;
+                        font-size: Theme.fs-xs;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: Theme.border-subtle; }
+
+        if root.page.loading : Rectangle {
+            vertical-stretch: 1;
+            Text {
+                text: @tr("Collecting system information...");
+                color: Theme.text-muted;
+                font-size: Theme.fs-md;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        if !root.page.loading && root.page.error != "" : Rectangle {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+                Text {
+                    text: "\u{E000}";
+                    font-family: "Material Icons";
+                    color: Theme.danger;
+                    font-size: 30px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: @tr("Could not collect system information");
+                    color: Theme.text-primary;
+                    font-size: Theme.fs-md;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.page.error;
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if !root.page.loading && root.page.error == "" : ScrollView {
+            vertical-stretch: 1;
+            viewport-width: self.visible-width;
+            viewport-height: max(self.visible-height, content.preferred-height);
+
+            content := VerticalLayout {
+                spacing: 12px;
+
+                overview-card := Rectangle {
+                    height: overview-content.preferred-height;
+                    background: Theme.bg-panel;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    overview-content := VerticalLayout {
+                        padding: 12px;
+                        spacing: 2px;
+                        SectionHeader { title: @tr("Overview"); }
+                        LabelValue { label: @tr("Operating system"); value: root.page.operating-system; }
+                        LabelValue { label: @tr("Kernel"); value: root.page.kernel; }
+                        LabelValue { label: @tr("Kernel version"); value: root.page.kernel-version; }
+                        LabelValue { label: @tr("Architecture"); value: root.page.architecture; }
+                        LabelValue { label: @tr("Hostname"); value: root.page.hostname; }
+                    }
+                }
+
+                cpu-card := Rectangle {
+                    height: cpu-content.preferred-height;
+                    background: Theme.bg-panel;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    cpu-content := VerticalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        SectionHeader { title: "CPU"; }
+                        LabelValue { label: @tr("Model"); value: root.page.cpu-name; }
+                        HorizontalLayout {
+                            spacing: 28px;
+                            Metric { label: @tr("Cores"); value: root.page.cpu-cores; }
+                            Metric { label: @tr("Frequency"); value: root.page.cpu-frequency; }
+                            Metric { label: @tr("Cache"); value: root.page.cpu-cache; }
+                            Metric { label: "BogoMips"; value: root.page.bogomips; }
+                        }
+                        Rectangle { height: 1px; background: Theme.border-subtle; }
+                        HorizontalLayout {
+                            spacing: 18px;
+                            Metric { label: @tr("User"); value: root.page.cpu-user; }
+                            Metric { label: @tr("System"); value: root.page.cpu-system; }
+                            Metric { label: "Nice"; value: root.page.cpu-nice; }
+                            Metric { label: @tr("Idle"); value: root.page.cpu-idle; }
+                            Metric { label: "IO"; value: root.page.cpu-io; }
+                            Metric { label: @tr("Hard IRQ"); value: root.page.cpu-hard-irq; }
+                            Metric { label: @tr("Soft IRQ"); value: root.page.cpu-soft-irq; }
+                            Metric { label: @tr("Steal"); value: root.page.cpu-steal; }
+                        }
+                    }
+                }
+
+                memory-card := Rectangle {
+                    height: memory-content.preferred-height;
+                    background: Theme.bg-panel;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    memory-content := VerticalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        SectionHeader { title: @tr("Memory and swap"); }
+                        HorizontalLayout {
+                            spacing: 24px;
+                            Metric { label: @tr("Memory total"); value: root.page.memory-total; }
+                            Metric { label: @tr("Memory used"); value: root.page.memory-used; }
+                            Metric { label: @tr("Memory usage"); value: root.page.memory-percent; }
+                            Metric { label: @tr("Memory available"); value: root.page.memory-free; }
+                        }
+                        HorizontalLayout {
+                            spacing: 24px;
+                            Metric { label: @tr("Swap total"); value: root.page.swap-total; }
+                            Metric { label: @tr("Swap used"); value: root.page.swap-used; }
+                            Metric { label: @tr("Swap usage"); value: root.page.swap-percent; }
+                            Metric { label: @tr("Swap available"); value: root.page.swap-free; }
+                        }
+                    }
+                }
+
+                network-card := Rectangle {
+                    height: network-content.preferred-height;
+                    background: Theme.bg-panel;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    network-content := VerticalLayout {
+                        padding: 12px;
+                        spacing: 3px;
+                        SectionHeader { title: @tr("Network interfaces"); }
+                        GridLayout {
+                            spacing-horizontal: 0px;
+                            spacing-vertical: 0px;
+                            Row {
+                                TableCell { text: @tr("Name"); width: 150px; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Sent"); horizontal-stretch: 1; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Received"); horizontal-stretch: 1; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Send rate"); horizontal-stretch: 1; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Receive rate"); horizontal-stretch: 1; height: 24px; text-color: Theme.text-muted; }
+                            }
+                            for net[i] in root.page.networks : Row {
+                                TableCell {
+                                    text: net.name;
+                                    width: 150px;
+                                    text-color: Theme.text-primary;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: net.sent;
+                                    horizontal-stretch: 1;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: net.received;
+                                    horizontal-stretch: 1;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: net.send-rate;
+                                    horizontal-stretch: 1;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: net.receive-rate;
+                                    horizontal-stretch: 1;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                filesystem-card := Rectangle {
+                    height: filesystem-content.preferred-height;
+                    background: Theme.bg-panel;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    filesystem-content := VerticalLayout {
+                        padding: 12px;
+                        spacing: 3px;
+                        SectionHeader { title: @tr("Filesystems"); }
+                        GridLayout {
+                            spacing-horizontal: 0px;
+                            spacing-vertical: 0px;
+                            Row {
+                                TableCell { text: @tr("Name"); width: 180px; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Size"); width: 100px; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Used"); width: 100px; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Usage"); width: 72px; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Available"); width: 100px; height: 24px; text-color: Theme.text-muted; }
+                                TableCell { text: @tr("Mount point"); horizontal-stretch: 1; height: 24px; text-color: Theme.text-muted; }
+                            }
+                            for fs[i] in root.page.filesystems : Row {
+                                TableCell {
+                                    text: fs.name;
+                                    width: 180px;
+                                    text-color: Theme.text-primary;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: fs.size;
+                                    width: 100px;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: fs.used;
+                                    width: 100px;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: fs.percent;
+                                    width: 72px;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: fs.available;
+                                    width: 100px;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                                TableCell {
+                                    text: fs.mount-point;
+                                    horizontal-stretch: 1;
+                                    cell-background: mod(i, 2) == 0 ? Theme.bg-panel-alt : transparent;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

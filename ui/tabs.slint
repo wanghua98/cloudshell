@@ -4,7 +4,8 @@ import { IconButton } from "widgets.slint";
 export struct TabInfo {
     id: string,
     title: string,
-    kind: string,   // "welcome" | "terminal"
+    kind: string,   // "welcome" | "terminal" | "system-info"
+    source-id: string, // source terminal for derived pages such as system info
     connected: bool,
 }
 
@@ -43,6 +44,7 @@ component SingleTab inherits Rectangle {
             y: (parent.height - self.height) / 2;
             border-radius: 4px;
             background: info.kind == "welcome" ? Theme.text-muted
+                : info.kind == "system-info" ? Theme.accent
                 : (info.connected ? Theme.success : Theme.warning);
         }
 

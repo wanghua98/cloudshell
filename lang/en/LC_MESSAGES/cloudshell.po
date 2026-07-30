@@ -135,8 +135,8 @@ msgstr "Directory tree"
 msgid "Size"
 msgstr "Size"
 
-msgid "Modified"
-msgstr "Modified"
+msgid "Unsaved changes"
+msgstr "Unsaved changes"
 
 msgid "Loading..."
 msgstr "Loading..."
@@ -380,3 +380,165 @@ msgstr "Please confirm"
 
 msgid "Confirm"
 msgstr "Confirm"
+
+msgid "System information"
+msgstr "System information"
+
+msgid "Collecting system information..."
+msgstr "Collecting system information..."
+
+msgid "Could not collect system information"
+msgstr "Could not collect system information"
+
+msgid "Overview"
+msgstr "Overview"
+
+msgid "Operating system"
+msgstr "Operating system"
+
+msgid "Kernel"
+msgstr "Kernel"
+
+msgid "Kernel version"
+msgstr "Kernel version"
+
+msgid "Architecture"
+msgstr "Architecture"
+
+msgid "Hostname"
+msgstr "Hostname"
+
+msgid "Model"
+msgstr "Model"
+
+msgid "Cores"
+msgstr "Cores"
+
+msgid "Frequency"
+msgstr "Frequency"
+
+msgid "Cache"
+msgstr "Cache"
+
+msgid "System"
+msgstr "System"
+
+msgid "Idle"
+msgstr "Idle"
+
+msgid "Hard IRQ"
+msgstr "Hard IRQ"
+
+msgid "Soft IRQ"
+msgstr "Soft IRQ"
+
+msgid "Steal"
+msgstr "Steal"
+
+msgid "Memory and swap"
+msgstr "Memory and swap"
+
+msgid "Memory total"
+msgstr "Memory total"
+
+msgid "Memory used"
+msgstr "Memory used"
+
+msgid "Memory usage"
+msgstr "Memory usage"
+
+msgid "Memory available"
+msgstr "Memory available"
+
+msgid "Swap total"
+msgstr "Swap total"
+
+msgid "Swap used"
+msgstr "Swap used"
+
+msgid "Swap usage"
+msgstr "Swap usage"
+
+msgid "Swap available"
+msgstr "Swap available"
+
+msgid "Network interfaces"
+msgstr "Network interfaces"
+
+msgid "Sent"
+msgstr "Sent"
+
+msgid "Received"
+msgstr "Received"
+
+msgid "Send rate"
+msgstr "Send rate"
+
+msgid "Receive rate"
+msgstr "Receive rate"
+
+msgid "Filesystems"
+msgstr "Filesystems"
+
+msgid "Used"
+msgstr "Used"
+
+msgid "Usage"
+msgstr "Usage"
+
+msgid "Available"
+msgstr "Available"
+
+msgid "Mount point"
+msgstr "Mount point"
+
+msgid "OpenSSH / PEM / PuTTY PPK private keys are supported (not .pub files)"
+msgstr "OpenSSH / PEM / PuTTY PPK private keys are supported (not .pub files)"
+
+msgid "Jump host"
+msgstr "Jump host"
+
+msgid "The selected saved SSH session supplies the bastion credentials and host-key policy."
+msgstr "The selected saved SSH session supplies the bastion credentials and host-key policy."
+
+msgid "Host key policy"
+msgstr "Host key policy"
+
+msgid "Ask"
+msgstr "Ask"
+
+msgid "Strict"
+msgstr "Strict"
+
+msgid "Accept new"
+msgstr "Accept new"
+
+msgid "Only a matching saved host key is accepted."
+msgstr "Only a matching saved host key is accepted."
+
+msgid "New keys are saved automatically; changed keys are rejected."
+msgstr "New keys are saved automatically; changed keys are rejected."
+
+msgid "Unknown or changed keys require confirmation."
+msgstr "Unknown or changed keys require confirmation."
+
+msgid "Connect timeout (s)"
+msgstr "Connect timeout (s)"
+
+msgid "Keepalive (s, 0=off)"
+msgstr "Keepalive (s, 0=off)"
+
+msgid "Miss limit"
+msgstr "Miss limit"
+
+msgid "Initial directory (optional)"
+msgstr "Initial directory (optional)"
+
+msgid "Startup command (optional)"
+msgstr "Startup command (optional)"
+
+msgid "Testing…"
+msgstr "Testing…"
+
+msgid "Test connection"
+msgstr "Test connection"

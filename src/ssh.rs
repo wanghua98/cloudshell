@@ -16,9 +16,11 @@ use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
 use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
-use crate::config::{AuthMethod, Session};
+use crate::config::{AuthMethod, HostKeyPolicy, Session};
 use crate::i18n::t;
+use crate::remote_system::SystemInfoSnapshot;
 
 // ---------------------------------------------------------------------------
 // SFTP-related shared types
@@ -328,6 +330,11 @@ pub enum SessionCommand {
     RawInput(Vec<u8>),
     /// Notify the remote PTY of a terminal resize.
     Resize(u32, u32),
+    /// Start or stop the expensive remote process sampler. The lightweight
+    /// CPU/memory/network monitor remains active independently.
+    SetProcessMonitor(bool),
+    /// Collect a one-shot system-information snapshot for `page_id`.
+    RequestSystemInfo(String),
     /// Gracefully disconnect and drop the session.
     Close,
 }
@@ -451,9 +458,18 @@ pub enum SessionEvent {
         net: Vec<(String, u64, u64)>,
         /// Per-filesystem (mount_point, available_bytes, total_bytes).
         disks: Vec<(String, u64, u64)>,
-        /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
-        procs: Vec<ProcInfo>,
     },
+    /// Top processes by CPU, sampled only while the process popup is open.
+    ProcessStats(Vec<ProcInfo>),
+    /// One-shot response for a system-information tab.
+    SystemInfo {
+        page_id: String,
+        info: Option<Box<SystemInfoSnapshot>>,
+        error: String,
+    },
+    /// Result of a dialog-initiated connection test. The test uses the same
+    /// transport, host-key and authentication path as a real session.
+    ConnectionTestResult { ok: bool, message: String },
 
     /// A command the user ran in the terminal, captured via the shell hook
     /// (OSC 697) so it can join the command-box history (#113).
@@ -514,6 +530,18 @@ impl SessionHandle {
         let _ = self.commands.send(SessionCommand::Resize(cols, rows));
     }
 
+    pub fn set_process_monitor(&self, enabled: bool) {
+        let _ = self
+            .commands
+            .send(SessionCommand::SetProcessMonitor(enabled));
+    }
+
+    pub fn request_system_info(&self, page_id: String) -> bool {
+        self.commands
+            .send(SessionCommand::RequestSystemInfo(page_id))
+            .is_ok()
+    }
+
     pub fn close(&self) {
         let _ = self.commands.send(SessionCommand::Close);
     }
@@ -564,6 +592,40 @@ pub fn spawn_session(
     )
 }
 
+/// Test transport negotiation, host-key verification, real authentication and
+/// authorization to open a session channel. No interactive shell is started.
+pub(crate) async fn test_connection(session: Session, events: UnboundedSender<SessionEvent>) {
+    let started = std::time::Instant::now();
+    let result = async {
+        let handle = connect_authenticated(&session, &events).await?;
+        let channel = handle
+            .channel_open_session()
+            .await
+            .context("authenticated, but server refused a session channel")?;
+        let _ = channel.close().await;
+        let _ = handle
+            .disconnect(Disconnect::ByApplication, "connection test complete", "")
+            .await;
+        Result::<_>::Ok(())
+    }
+    .await;
+    let (ok, message) = match result {
+        Ok(()) => (
+            true,
+            format!(
+                "{}（{} ms）",
+                t(
+                    "连接、主机密钥校验和真实认证均成功",
+                    "Connection, host-key verification and authentication succeeded"
+                ),
+                started.elapsed().as_millis()
+            ),
+        ),
+        Err(error) => (false, format!("{error:#}")),
+    };
+    let _ = events.send(SessionEvent::ConnectionTestResult { ok, message });
+}
+
 async fn run_session(
     session: Session,
     mut commands: UnboundedReceiver<SessionCommand>,
@@ -579,93 +641,7 @@ async fn run_session(
         session.port
     )));
 
-    let mut handle = connect_ssh(&session, &events).await?;
-
-    // Resolve missing username/password by prompting the user (#110).
-    let (user, password) = match resolve_credentials(&session, &events).await {
-        Some(c) => c,
-        None => {
-            let _ = events.send(SessionEvent::Closed(
-                t("已取消登录", "login cancelled").into(),
-            ));
-            let _ = handle
-                .disconnect(Disconnect::ByApplication, "cancelled", "")
-                .await;
-            return Ok(());
-        }
-    };
-
-    // --- Auth ----------------------------------------------------------
-    let authed = match session.auth {
-        AuthMethod::Password => {
-            let password_authed = handle
-                .authenticate_password(&user, password.as_str())
-                .await
-                .context("password auth failed")?;
-            if password_authed {
-                true
-            } else {
-                // russh cannot safely start keyboard-interactive on a handle
-                // that has already failed password authentication. Close it and
-                // reconnect before retrying, as JumpServer-style bastions often
-                // offer only keyboard-interactive.
-                let _ = events.send(SessionEvent::Status(
-                    t(
-                        "密码认证失败，改用键盘交互认证…",
-                        "Password rejected; retrying keyboard-interactive…",
-                    )
-                    .into(),
-                ));
-                let _ = handle
-                    .disconnect(Disconnect::ByApplication, "retry keyboard-interactive", "")
-                    .await;
-                handle = connect_ssh(&session, &events).await?;
-                authenticate_keyboard_interactive(&mut handle, &user, password.as_str()).await?
-            }
-        }
-        AuthMethod::Key => {
-            let raw = session.private_key_path.trim();
-            if raw.is_empty() {
-                return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
-            }
-            // Normalise separators (we store `/` everywhere) and be forgiving if
-            // the user pointed at the `.pub` *public* key — the private key is the
-            // same path without that suffix.
-            let normalised = raw.replace('\\', "/");
-            let key_path = normalised
-                .strip_suffix(".pub")
-                .map(str::to_string)
-                .unwrap_or(normalised);
-            // An encrypted private key needs its passphrase; we reuse the
-            // session's password field for it (empty = unencrypted key) (#90).
-            let pass = password.as_str();
-            let keypair = load_secret_key(
-                Path::new(&key_path),
-                if pass.is_empty() { None } else { Some(pass) },
-            )
-            .with_context(|| format!("failed to load key {key_path}"))?;
-            // RSA keys must be signed with an explicit SHA-2 hash; every other
-            // key type carries its own algorithm, so no override is needed.
-            let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
-                .context("invalid private key / hash algorithm combination")?;
-            handle
-                .authenticate_publickey(&user, key_with_hash)
-                .await
-                .context("publickey auth failed")?
-        }
-    };
-
-    if !authed {
-        tracing::warn!("ssh authentication failed for {}@{}", user, session.host);
-        let _ = events.send(SessionEvent::Closed(
-            t("认证失败", "authentication failed").into(),
-        ));
-        let _ = handle
-            .disconnect(Disconnect::ByApplication, "auth failed", "")
-            .await;
-        return Ok(());
-    }
+    let mut handle = connect_authenticated(&session, &events).await?;
 
     // --- Shell channel --------------------------------------------------
     let mut channel = handle
@@ -686,6 +662,25 @@ async fn run_session(
         .await
         .context("request PTY")?;
     channel.request_shell(true).await.context("request shell")?;
+
+    // Apply the per-session startup policy on the same interactive channel.
+    // The directory is shell-quoted as data, not interpolated as syntax.
+    let mut startup = String::new();
+    if !session.initial_directory.trim().is_empty() {
+        startup.push_str("cd -- ");
+        startup.push_str(&shell_quote(session.initial_directory.trim()));
+        startup.push('\r');
+    }
+    if !session.startup_command.trim().is_empty() {
+        startup.push_str(session.startup_command.trim());
+        startup.push('\r');
+    }
+    if !startup.is_empty() {
+        channel
+            .data(startup.as_bytes())
+            .await
+            .context("send session startup commands")?;
+    }
 
     let _ = events.send(SessionEvent::Connected);
     let _ = events.send(SessionEvent::Status(format!(
@@ -761,11 +756,15 @@ async fn run_session(
     // more portable than hardcoding one absolute path per tool (their location
     // differs across distros). Monitoring is best-effort, so even if this shell
     // is unusual and the reset finds nothing, only the sidebar stats are lost.
-    // The `ps` section feeds the process monitor (#23): top-40 by CPU, columns
-    // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
-    // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
-    // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; sleep 2; done\n";
+    // Filesystem capacity changes slowly, so `df` runs once every 15 samples
+    // instead of every two seconds. This matters on hosts with slow or stale
+    // network mounts. Process enumeration is intentionally absent here; it has
+    // its own on-demand channel below.
+    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; i=0; while :; do awk '/^cpu /{print;next} /^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print;next} FILENAME==\"/proc/net/dev\"{print}' /proc/stat /proc/meminfo /proc/net/dev; echo __DF__; if [ \"$i\" -eq 0 ]; then df -kP 2>/dev/null; fi; i=$(( (i + 1) % 15 )); echo __MSTICK__; sleep 2; done\n";
+    // Sorting the full process table is considerably more expensive than
+    // reading /proc counters. Run it only while the user is actually looking
+    // at the process popup; closing the popup tears this channel down.
+    const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __PSTICK__; sleep 2; done\n";
     let mut mon_channel = if shell_integration {
         match handle.channel_open_session().await {
             Ok(ch) => match ch.exec(true, MON_CMD).await {
@@ -784,6 +783,8 @@ async fn run_session(
         None
     };
     let mut mon_buf = String::new();
+    let mut proc_channel: Option<Channel<Msg>> = None;
+    let mut proc_buf = String::new();
     let mut prev_cpu: Option<(u64, u64)> = None; // (total jiffies, idle jiffies)
     let mut prev_net: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new(); // iface -> (rx_bytes, tx_bytes)
@@ -861,6 +862,42 @@ async fn run_session(
                     }
                     Some(SessionCommand::Resize(cols, rows)) => {
                         let _ = channel.window_change(cols, rows, 0, 0).await;
+                    }
+                    Some(SessionCommand::SetProcessMonitor(enabled)) => {
+                        if enabled && proc_channel.is_none() {
+                            match handle.channel_open_session().await {
+                                Ok(ch) => match ch.exec(true, PROC_CMD).await {
+                                    Ok(()) => {
+                                        proc_channel = Some(ch);
+                                        proc_buf.clear();
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("process monitor exec failed: {err}");
+                                    }
+                                },
+                                Err(err) => {
+                                    tracing::warn!("process monitor channel open failed: {err}");
+                                }
+                            }
+                        } else if !enabled {
+                            if let Some(ch) = proc_channel.take() {
+                                // EOF only closes stdin; this command does not
+                                // read stdin and would keep its loop alive.
+                                // Close the SSH channel so the remote shell and
+                                // its `ps` loop are actually terminated.
+                                let _ = ch.close().await;
+                            }
+                            proc_buf.clear();
+                        }
+                    }
+                    Some(SessionCommand::RequestSystemInfo(page_id)) => {
+                        // A separate one-shot channel keeps the interactive PTY
+                        // responsive during the one-second interval sample.
+                        let info_handle = handle.clone();
+                        let info_events = events.clone();
+                        tokio::spawn(async move {
+                            collect_system_info(info_handle, page_id, info_events).await;
+                        });
                     }
                     Some(SessionCommand::Close) | None => {
                         let _ = channel.eof().await;
@@ -1087,6 +1124,35 @@ async fn run_session(
                     _ => {}
                 }
             }
+            proc_msg = async {
+                match proc_channel.as_mut() {
+                    Some(ch) => ch.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match proc_msg {
+                    Some(ChannelMsg::Data { data }) => {
+                        proc_buf.push_str(&String::from_utf8_lossy(&data));
+                        while let Some(idx) = proc_buf.find("__PSTICK__") {
+                            let procs = parse_process_block(&proc_buf[..idx]);
+                            let rest = proc_buf[idx + "__PSTICK__".len()..]
+                                .trim_start_matches(['\r', '\n'])
+                                .to_string();
+                            proc_buf = rest;
+                            let _ = events.send(SessionEvent::ProcessStats(procs));
+                        }
+                        const PROC_BUF_CAP: usize = 1 << 18;
+                        if proc_buf.len() > PROC_BUF_CAP {
+                            proc_buf.clear();
+                        }
+                    }
+                    Some(ChannelMsg::Close) | None => {
+                        proc_channel = None;
+                        proc_buf.clear();
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1112,21 +1178,76 @@ async fn run_session(
     Ok(())
 }
 
-/// Establish a fresh SSH transport, including proxy tunnelling and the client
-/// handler required for remote port forwards. Authentication deliberately stays
-/// outside this function so callers can reconnect before changing methods.
-async fn connect_ssh(
-    session: &Session,
-    events: &UnboundedSender<SessionEvent>,
-) -> Result<Handle<ClientHandler>> {
-    let config = Arc::new(client::Config {
-        // Keep an otherwise idle terminal alive through NAT/firewall state
-        // expiry. This also matters when shell integration (and its monitor
-        // channel) is disabled for Windows or appliance shells.
-        keepalive_interval: Some(std::time::Duration::from_secs(30)),
-        keepalive_max: 3,
+async fn collect_system_info(
+    handle: Arc<Handle<ClientHandler>>,
+    page_id: String,
+    events: UnboundedSender<SessionEvent>,
+) {
+    let result: Result<SystemInfoSnapshot> = async {
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .context("open system information channel")?;
+        channel
+            .exec(true, crate::remote_system::SYSTEM_INFO_COMMAND)
+            .await
+            .context("run system information command")?;
+
+        let mut output = Vec::new();
+        let mut exit_status = 0;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    if output.len().saturating_add(data.len())
+                        > crate::remote_system::MAX_OUTPUT_BYTES
+                    {
+                        let _ = channel.close().await;
+                        return Err(anyhow!("system information response exceeded size limit"));
+                    }
+                    output.extend_from_slice(&data);
+                }
+                ChannelMsg::ExitStatus {
+                    exit_status: status,
+                } => exit_status = status,
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        if exit_status != 0 && output.is_empty() {
+            return Err(anyhow!(
+                "system information command exited with code {exit_status}"
+            ));
+        }
+        let text = String::from_utf8_lossy(&output);
+        crate::remote_system::parse_system_info(&text).map_err(|error| anyhow!(error))
+    }
+    .await;
+
+    let event = match result {
+        Ok(info) => SessionEvent::SystemInfo {
+            page_id,
+            info: Some(Box::new(info)),
+            error: String::new(),
+        },
+        Err(error) => SessionEvent::SystemInfo {
+            page_id,
+            info: None,
+            error: format!("{error:#}"),
+        },
+    };
+    let _ = events.send(event);
+}
+
+fn client_config(session: &Session) -> Arc<client::Config> {
+    Arc::new(client::Config {
+        keepalive_interval: (session.keepalive_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(u64::from(session.keepalive_interval_secs))),
+        keepalive_max: usize::from(session.keepalive_max),
         ..<_>::default()
-    });
+    })
+}
+
+fn client_handler(session: &Session, events: &UnboundedSender<SessionEvent>) -> ClientHandler {
     let remote_forwards = session
         .forwards
         .iter()
@@ -1138,32 +1259,256 @@ async fn connect_ssh(
             )
         })
         .collect();
-    let handler = ClientHandler {
+    ClientHandler {
         host: session.host.clone(),
         port: session.port,
+        host_key_policy: session.host_key_policy,
         remote_forwards,
         events: events.clone(),
-    };
-    let address = format!("{}:{}", session.host, session.port);
-    match crate::proxy::resolve(&session.proxy) {
-        Some(proxy) => {
-            let _ = events.send(SessionEvent::Status(format!(
-                "{} {} → {}",
-                t("经代理连接", "via proxy"),
-                crate::proxy::describe(&proxy),
-                address
-            )));
-            let stream = crate::proxy::connect(&proxy, &session.host, session.port)
-                .await
-                .with_context(|| format!("proxy connect to {address} failed"))?;
-            client::connect_stream(config, stream, handler)
-                .await
-                .with_context(|| format!("connect {address} failed"))
-        }
-        None => client::connect(config, address.as_str(), handler)
-            .await
-            .with_context(|| format!("connect {address} failed")),
     }
+}
+
+async fn with_connect_timeout<T>(
+    session: &Session,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if session.connect_timeout_secs == 0 {
+        return future.await;
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(session.connect_timeout_secs)),
+        future,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "connect {}:{} timed out after {}s",
+            session.host, session.port, session.connect_timeout_secs
+        )
+    })?
+}
+
+/// Establish a direct SSH transport, including optional HTTP/SOCKS proxying.
+async fn connect_direct_transport(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Handle<ClientHandler>> {
+    let config = client_config(session);
+    let handler = client_handler(session, events);
+    let address = format!("{}:{}", session.host, session.port);
+    with_connect_timeout(session, async {
+        match crate::proxy::resolve(&session.proxy) {
+            Some(proxy) => {
+                let _ = events.send(SessionEvent::Status(format!(
+                    "{} {} → {}",
+                    t("经代理连接", "via proxy"),
+                    crate::proxy::describe(&proxy),
+                    address
+                )));
+                let stream = crate::proxy::connect(&proxy, &session.host, session.port)
+                    .await
+                    .with_context(|| format!("proxy connect to {address} failed"))?;
+                client::connect_stream(config, stream, handler)
+                    .await
+                    .with_context(|| format!("connect {address} failed"))
+            }
+            None => client::connect(config, address.as_str(), handler)
+                .await
+                .with_context(|| format!("connect {address} failed")),
+        }
+    })
+    .await
+}
+
+/// Establish the target transport. When a bastion is configured, authenticate
+/// it first and open an RFC 4254 `direct-tcpip` channel to the target.
+async fn connect_transport(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Handle<ClientHandler>> {
+    let Some(jump) = session.jump_session.as_deref() else {
+        return connect_direct_transport(session, events).await;
+    };
+
+    let _ = events.send(SessionEvent::Status(format!(
+        "{} {}@{}:{} → {}:{}",
+        t("经跳板连接", "via jump host"),
+        jump.user,
+        jump.host,
+        jump.port,
+        session.host,
+        session.port
+    )));
+    let jump_handle = connect_direct_authenticated(jump, events).await?;
+    let stream = with_connect_timeout(session, async {
+        jump_handle
+            .channel_open_direct_tcpip(
+                session.host.clone(),
+                u32::from(session.port),
+                "127.0.0.1",
+                0,
+            )
+            .await
+            .context("jump host refused direct-tcpip forwarding")
+    })
+    .await?
+    .into_stream();
+
+    with_connect_timeout(session, async {
+        client::connect_stream(
+            client_config(session),
+            stream,
+            client_handler(session, events),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "connect {}:{} through jump host failed",
+                session.host, session.port
+            )
+        })
+    })
+    .await
+}
+
+fn load_private_key(session: &Session, passphrase: &str) -> Result<ssh_key::PrivateKey> {
+    let key_path = normalized_private_key_path(session)?;
+    let passphrase = (!passphrase.is_empty()).then_some(passphrase);
+    if key_path.to_ascii_lowercase().ends_with(".ppk") {
+        crate::ppk::load(Path::new(&key_path), passphrase)
+            .with_context(|| format!("failed to load PuTTY key {key_path}"))
+    } else {
+        load_secret_key(Path::new(&key_path), passphrase)
+            .with_context(|| format!("failed to load key {key_path}"))
+    }
+}
+
+fn normalized_private_key_path(session: &Session) -> Result<String> {
+    let raw = session.private_key_path.trim();
+    if raw.is_empty() {
+        return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
+    }
+    let normalised = raw.replace('\\', "/");
+    Ok(normalised
+        .strip_suffix(".pub")
+        .map(str::to_string)
+        .unwrap_or(normalised))
+}
+
+fn private_key_is_encrypted(session: &Session) -> bool {
+    let Ok(path) = normalized_private_key_path(session) else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read(&path) else {
+        return false;
+    };
+    if path.to_ascii_lowercase().ends_with(".ppk") {
+        return String::from_utf8_lossy(&raw)
+            .lines()
+            .find_map(|line| line.strip_prefix("Encryption: "))
+            .is_some_and(|encryption| encryption.trim() != "none");
+    }
+    if raw
+        .windows(b"ENCRYPTED".len())
+        .any(|part| part == b"ENCRYPTED")
+    {
+        return true;
+    }
+    ssh_key::PrivateKey::from_openssh(&raw)
+        .map(|key| key.is_encrypted())
+        .unwrap_or(false)
+}
+
+async fn authenticate_primary(
+    handle: &mut Handle<ClientHandler>,
+    session: &Session,
+    user: &str,
+    password: &str,
+) -> Result<bool> {
+    match session.auth {
+        AuthMethod::Password => handle
+            .authenticate_password(user, password)
+            .await
+            .context("password auth failed"),
+        AuthMethod::Key => {
+            let keypair = load_private_key(session, password)?;
+            let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
+                .context("invalid private key / hash algorithm combination")?;
+            handle
+                .authenticate_publickey(user, key_with_hash)
+                .await
+                .context("publickey auth failed")
+        }
+    }
+}
+
+async fn authenticate_with_direct_reconnect(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Handle<ClientHandler>> {
+    let (user, password) = resolve_credentials(session, events)
+        .await
+        .ok_or_else(|| anyhow!(t("已取消登录", "login cancelled")))?;
+    let mut handle = connect_direct_transport(session, events).await?;
+    if authenticate_primary(&mut handle, session, &user, &password).await? {
+        return Ok(handle);
+    }
+    if session.auth == AuthMethod::Password {
+        let _ = handle
+            .disconnect(Disconnect::ByApplication, "retry keyboard-interactive", "")
+            .await;
+        handle = connect_direct_transport(session, events).await?;
+        if authenticate_keyboard_interactive(&mut handle, &user, &password).await? {
+            return Ok(handle);
+        }
+    }
+    bail_auth(session, &user)
+}
+
+async fn connect_direct_authenticated(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Handle<ClientHandler>> {
+    authenticate_with_direct_reconnect(session, events).await
+}
+
+/// Shared, fully authenticated SSH connection used by terminal, SFTP and the
+/// connection tester. This is the single source of truth for proxy, jump-host,
+/// host-key, password/keyboard-interactive and private-key behavior.
+pub(crate) async fn connect_authenticated(
+    session: &Session,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Handle<ClientHandler>> {
+    let (user, password) = resolve_credentials(session, events)
+        .await
+        .ok_or_else(|| anyhow!(t("已取消登录", "login cancelled")))?;
+    let mut handle = connect_transport(session, events).await?;
+    if authenticate_primary(&mut handle, session, &user, &password).await? {
+        return Ok(handle);
+    }
+    if session.auth == AuthMethod::Password {
+        let _ = events.send(SessionEvent::Status(
+            t(
+                "密码认证失败，改用键盘交互认证…",
+                "Password rejected; retrying keyboard-interactive…",
+            )
+            .into(),
+        ));
+        let _ = handle
+            .disconnect(Disconnect::ByApplication, "retry keyboard-interactive", "")
+            .await;
+        handle = connect_transport(session, events).await?;
+        if authenticate_keyboard_interactive(&mut handle, &user, &password).await? {
+            return Ok(handle);
+        }
+    }
+    bail_auth(session, &user)
+}
+
+fn bail_auth<T>(session: &Session, user: &str) -> Result<T> {
+    tracing::warn!("ssh authentication failed for {}@{}", user, session.host);
+    Err(anyhow!(t("认证失败", "authentication failed")))
 }
 
 /// Authenticate through keyboard-interactive, replying with the configured
@@ -1191,6 +1536,13 @@ async fn authenticate_keyboard_interactive(
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 /// Parse one monitor sample (a block of `/proc/stat` cpu line + `/proc/meminfo`
 /// fields) into a [`SessionEvent::ResourceStats`].
 ///
@@ -1214,20 +1566,16 @@ fn parse_monitor_block(
     let mut net_now: Vec<(String, u64, u64)> = Vec::new();
     // Filesystems from `df -kP`: (mount, available_bytes, total_bytes).
     let mut disks: Vec<(String, u64, u64)> = Vec::new();
-    // Processes from `ps` (#23): top-by-CPU rows.
-    let mut procs: Vec<ProcInfo> = Vec::new();
     // The sample is split into sections by `echo` markers; everything before the
     // first marker is the cpu/mem/net block.
     enum Section {
         Top,
         Df,
-        Ps,
     }
     let mut section = Section::Top;
 
-    // Cap how many interfaces / filesystems / processes we accept from one sample
-    // so a hostile server can't flood the parser and sidebar with fabricated rows
-    // (#27). No real machine has anywhere near this many.
+    // Cap how many interfaces / filesystems we accept from one sample so a
+    // hostile server can't flood the parser and sidebar with fabricated rows.
     const MAX_MON_ENTRIES: usize = 64;
 
     for line in block.lines() {
@@ -1235,23 +1583,11 @@ fn parse_monitor_block(
             section = Section::Df;
             continue;
         }
-        if line == "__PS__" {
-            section = Section::Ps;
-            continue;
-        }
         match section {
             Section::Df => {
                 if disks.len() < MAX_MON_ENTRIES {
                     if let Some(d) = parse_df_line(line) {
                         disks.push(d);
-                    }
-                }
-                continue;
-            }
-            Section::Ps => {
-                if procs.len() < MAX_MON_ENTRIES {
-                    if let Some(p) = parse_ps_line(line) {
-                        procs.push(p);
                     }
                 }
                 continue;
@@ -1339,8 +1675,18 @@ fn parse_monitor_block(
         swap_total_kib: swap_total,
         net,
         disks,
-        procs,
     })
+}
+
+/// Parse one on-demand process sample. Keeping this out of the regular resource
+/// parser means a connected but idle terminal does no process-list allocation.
+fn parse_process_block(block: &str) -> Vec<ProcInfo> {
+    const MAX_PROCESSES: usize = 40;
+    block
+        .lines()
+        .filter_map(parse_ps_line)
+        .take(MAX_PROCESSES)
+        .collect()
 }
 
 /// Parse one `ps -eo pid,user,pcpu,pmem,args` line into a [`ProcInfo`]. The
@@ -1426,6 +1772,7 @@ fn parse_net_dev_line(line: &str) -> Option<(String, (u64, u64))> {
 pub(crate) struct ClientHandler {
     pub(crate) host: String,
     pub(crate) port: u16,
+    pub(crate) host_key_policy: HostKeyPolicy,
     pub(crate) remote_forwards: std::collections::HashMap<u32, (String, u16)>,
     pub(crate) events: UnboundedSender<SessionEvent>,
 }
@@ -1438,11 +1785,36 @@ pub(crate) async fn verify_host_key(
     host: &str,
     port: u16,
     key: &PublicKey,
+    policy: HostKeyPolicy,
     events: &UnboundedSender<SessionEvent>,
 ) -> bool {
     use crate::known_hosts::HostKeyStatus;
     match crate::known_hosts::verify(host, port, key) {
         HostKeyStatus::Match => true,
+        HostKeyStatus::Unknown if policy == HostKeyPolicy::AcceptNew => {
+            match crate::known_hosts::remember(host, port, key) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!("could not save host key for {host}:{port}: {error:#}");
+                    false
+                }
+            }
+        }
+        status @ (HostKeyStatus::Unknown | HostKeyStatus::Changed)
+            if policy == HostKeyPolicy::Strict =>
+        {
+            tracing::warn!(
+                host,
+                port,
+                changed = matches!(status, HostKeyStatus::Changed),
+                "host key rejected by strict policy"
+            );
+            false
+        }
+        HostKeyStatus::Changed if policy == HostKeyPolicy::AcceptNew => {
+            tracing::warn!(host, port, "changed host key rejected by accept-new policy");
+            false
+        }
         status => {
             let changed = status == HostKeyStatus::Changed;
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1478,11 +1850,12 @@ pub(crate) async fn verify_host_key(
 pub(crate) async fn resolve_credentials(
     session: &Session,
     events: &UnboundedSender<SessionEvent>,
-) -> Option<(String, String)> {
+) -> Option<(String, Zeroizing<String>)> {
     let mut user = session.user.trim().to_string();
-    let mut password = session.password.as_str().to_string();
+    let mut password = Zeroizing::new(session.password.as_str().to_string());
     let need_user = user.is_empty();
-    let need_password = matches!(session.auth, AuthMethod::Password) && password.is_empty();
+    let need_password = password.is_empty()
+        && (matches!(session.auth, AuthMethod::Password) || private_key_is_encrypted(session));
     if !(need_user || need_password) {
         return Some((user, password));
     }
@@ -1504,7 +1877,7 @@ pub(crate) async fn resolve_credentials(
                 user = u.trim().to_string();
             }
             if need_password {
-                password = p;
+                password = Zeroizing::new(p);
             }
             Some((user, password))
         }
@@ -1520,7 +1893,14 @@ impl Handler for ClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(verify_host_key(&self.host, self.port, server_public_key, &self.events).await)
+        Ok(verify_host_key(
+            &self.host,
+            self.port,
+            server_public_key,
+            self.host_key_policy,
+            &self.events,
+        )
+        .await)
     }
 
     /// Remote forward (-R): the server opened a channel for a connection that
@@ -1663,7 +2043,7 @@ mod osc_command_tests {
 
 #[cfg(test)]
 mod monitor_hardening_tests {
-    use super::{parse_df_line, parse_monitor_block};
+    use super::{parse_df_line, parse_monitor_block, parse_process_block};
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -1700,5 +2080,17 @@ mod monitor_hardening_tests {
         assert!(parse_monitor_block(&block, &mut prev, &mut prev_net, &mut at).is_some());
         // The remembered interface set is capped, not 500.
         assert!(prev_net.len() <= 64, "prev_net held {}", prev_net.len());
+    }
+
+    #[test]
+    fn on_demand_process_samples_are_validated_and_capped() {
+        let mut block = String::from("PID USER %CPU %MEM COMMAND\nnot-a-process\n");
+        for pid in 1..=100 {
+            block.push_str(&format!("{pid} root 1.5 0.2 worker-{pid}\n"));
+        }
+        let procs = parse_process_block(&block);
+        assert_eq!(procs.len(), 40);
+        assert_eq!(procs[0].pid, 1);
+        assert_eq!(procs[39].pid, 40);
     }
 }

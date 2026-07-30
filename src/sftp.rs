@@ -10,7 +10,6 @@
 //! terminal tab.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,20 +17,16 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
-use russh::client::{self, Handler};
-use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::load_secret_key;
+use russh::client;
 use russh::Disconnect;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::config::{AuthMethod, Session};
+use crate::config::Session;
 use crate::i18n::t;
 use crate::ssh::{format_mtime, format_size, RemoteEntry, RemoteTreeNode, SessionEvent};
 
@@ -233,80 +228,11 @@ async fn run_sftp(
         t("SFTP 连接中...", "SFTP connecting...").into(),
     ));
 
-    // Open a dedicated SSH connection for SFTP.
-    let config = Arc::new(client::Config {
-        // SFTP can sit idle with no terminal-like traffic, so actively keep
-        // this separate SSH transport alive through NATs and idle sshd rules.
-        keepalive_interval: Some(std::time::Duration::from_secs(30)),
-        keepalive_max: 3,
-        ..<_>::default()
-    });
-
-    let addr = format!("{}:{}", session.host, session.port);
-    // Tunnel through the same proxy as the shell session, if configured.
-    let mut handle = match crate::proxy::resolve(&session.proxy) {
-        Some(p) => {
-            let stream = crate::proxy::connect(&p, &session.host, session.port)
-                .await
-                .with_context(|| format!("sftp proxy connect {} failed", addr))?;
-            client::connect_stream(config, stream, sftp_handler(&session, &events))
-                .await
-                .with_context(|| format!("sftp connect {} failed", addr))?
-        }
-        None => client::connect(config, addr.as_str(), sftp_handler(&session, &events))
-            .await
-            .with_context(|| format!("sftp connect {} failed", addr))?,
-    };
-
-    // Resolve missing username/password (shares the shell's prompt; the UI
-    // de-dupes by session id so SFTP doesn't prompt a second time) (#110).
-    let (user, password) = match crate::ssh::resolve_credentials(&session, &events).await {
-        Some(c) => c,
-        None => return Err(anyhow!(t("已取消登录", "login cancelled"))),
-    };
-
-    // --- Authenticate (same method as the shell session) -------------------
-    let authed = match session.auth {
-        AuthMethod::Password => handle
-            .authenticate_password(&user, password.as_str())
-            .await
-            .context("sftp password auth failed")?,
-        AuthMethod::Key => {
-            let raw = session.private_key_path.trim();
-            if raw.is_empty() {
-                return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
-            }
-            let normalised = raw.replace('\\', "/");
-            let key_path = normalised
-                .strip_suffix(".pub")
-                .map(str::to_string)
-                .unwrap_or(normalised);
-            // Match the shell connection: the session password doubles as the
-            // private-key passphrase for encrypted keys (empty = no passphrase).
-            let passphrase = password.as_str();
-            let keypair = load_secret_key(
-                Path::new(&key_path),
-                if passphrase.is_empty() {
-                    None
-                } else {
-                    Some(passphrase)
-                },
-            )
-            .with_context(|| format!("failed to load key {key_path}"))?;
-            // RSA keys need an explicit SHA-2 hash; other key types don't.
-            let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
-                .context("invalid private key")?;
-            handle
-                .authenticate_publickey(&user, key_with_hash)
-                .await
-                .context("sftp publickey auth failed")?
-        }
-    };
-
-    if !authed {
-        return Err(anyhow!(t("SFTP 认证失败", "SFTP authentication failed")));
-    }
+    // Use the exact same proxy/jump-host/host-key/authentication pipeline as
+    // the terminal and the connection tester.
+    let handle = crate::ssh::connect_authenticated(&session, &events)
+        .await
+        .context("SFTP SSH connection failed")?;
 
     // --- Open the sftp subsystem channel -----------------------------------
     let channel = handle
@@ -1113,7 +1039,7 @@ fn sh_quote(s: &str) -> String {
 
 /// Run a one-shot command on the remote over its own exec channel and return
 /// the exit status. Stdout/stderr are drained and discarded.
-async fn exec_remote(handle: &client::Handle<SftpClientHandler>, cmd: &str) -> Result<u32> {
+async fn exec_remote(handle: &client::Handle<crate::ssh::ClientHandler>, cmd: &str) -> Result<u32> {
     let mut ch = handle
         .channel_open_session()
         .await
@@ -1394,7 +1320,7 @@ fn emit_transfer(
 /// transfer was cancelled. In both the cancel and error cases the partial
 /// local file is removed so no half-downloaded junk is left behind.
 async fn open_transfer_session(
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &client::Handle<crate::ssh::ClientHandler>,
     purpose: &str,
 ) -> Result<Arc<RawSftpSession>> {
     let channel = handle
@@ -1413,7 +1339,7 @@ async fn open_transfer_session(
 }
 
 async fn download_impl(
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &client::Handle<crate::ssh::ClientHandler>,
     remote: &str,
     local: &str,
     name: &str,
@@ -1590,7 +1516,7 @@ async fn download_with_session(
 /// so a hostile server can't escape the chosen folder.
 async fn download_dir(
     sftp: &SftpSession,
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &client::Handle<crate::ssh::ClientHandler>,
     remote_root: &str,
     local_parent: &str,
     events: &UnboundedSender<SessionEvent>,
@@ -1669,7 +1595,7 @@ async fn remove_dir_recursive(sftp: &SftpSession, root: &str) -> Result<()> {
 /// "already exists" error is ignored), then upload its files with the pipelined
 /// path. Symlinks and other special files are skipped.
 async fn upload_dir(
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &client::Handle<crate::ssh::ClientHandler>,
     sftp: &SftpSession,
     local_root: &str,
     remote_parent: &str,
@@ -1723,7 +1649,7 @@ async fn upload_dir(
 /// which hides the latency and brings us within a single order of magnitude of
 /// native scp.
 async fn upload_pipelined(
-    handle: &client::Handle<SftpClientHandler>,
+    handle: &client::Handle<crate::ssh::ClientHandler>,
     local: &str,
     remote: &str,
     name: &str,
@@ -1843,50 +1769,6 @@ async fn upload_with_session(
     }
     emit_transfer(events, id, name, true, done, total.max(done), 1, "");
     Ok(true)
-}
-
-// ---------------------------------------------------------------------------
-// russh client handler — verifies the host key against known_hosts, reusing the
-// shell session's prompt path (#109-5). The UI de-duplicates by host:port, so a
-// fresh host confirmed for the shell won't prompt again for SFTP.
-// ---------------------------------------------------------------------------
-
-struct SftpClientHandler {
-    host: String,
-    port: u16,
-    events: UnboundedSender<SessionEvent>,
-}
-
-fn sftp_handler(session: &Session, events: &UnboundedSender<SessionEvent>) -> SftpClientHandler {
-    SftpClientHandler {
-        host: session.host.clone(),
-        port: session.port,
-        events: events.clone(),
-    }
-}
-
-#[async_trait]
-impl Handler for SftpClientHandler {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        server_public_key: &PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(
-            crate::ssh::verify_host_key(&self.host, self.port, server_public_key, &self.events)
-                .await,
-        )
-    }
-
-    async fn data(
-        &mut self,
-        _channel: russh::ChannelId,
-        _data: &[u8],
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
 }
 
 // Keep format helpers and RemoteTreeNode imports live.

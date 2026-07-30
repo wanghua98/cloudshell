@@ -183,8 +183,8 @@ msgstr "八进制权限,例如 755"
 msgid "Read-only"
 msgstr "只读"
 
-msgid "Modified"
-msgstr "已修改"
+msgid "Unsaved changes"
+msgstr "未保存"
 
 msgid "View"
 msgstr "查看"
@@ -389,3 +389,165 @@ msgstr "请确认"
 
 msgid "Confirm"
 msgstr "确认"
+
+msgid "System information"
+msgstr "系统信息"
+
+msgid "Collecting system information..."
+msgstr "正在采集系统信息..."
+
+msgid "Could not collect system information"
+msgstr "无法采集系统信息"
+
+msgid "Overview"
+msgstr "系统概览"
+
+msgid "Operating system"
+msgstr "操作系统"
+
+msgid "Kernel"
+msgstr "内核"
+
+msgid "Kernel version"
+msgstr "内核版本"
+
+msgid "Architecture"
+msgstr "硬件架构"
+
+msgid "Hostname"
+msgstr "主机名称"
+
+msgid "Model"
+msgstr "型号"
+
+msgid "Cores"
+msgstr "核心数"
+
+msgid "Frequency"
+msgstr "频率"
+
+msgid "Cache"
+msgstr "缓存"
+
+msgid "System"
+msgstr "系统"
+
+msgid "Idle"
+msgstr "空闲"
+
+msgid "Hard IRQ"
+msgstr "硬件中断"
+
+msgid "Soft IRQ"
+msgstr "软件中断"
+
+msgid "Steal"
+msgstr "虚拟化占用"
+
+msgid "Memory and swap"
+msgstr "内存与交换空间"
+
+msgid "Memory total"
+msgstr "内存总量"
+
+msgid "Memory used"
+msgstr "已用内存"
+
+msgid "Memory usage"
+msgstr "内存占用"
+
+msgid "Memory available"
+msgstr "可用内存"
+
+msgid "Swap total"
+msgstr "交换空间总量"
+
+msgid "Swap used"
+msgstr "已用交换空间"
+
+msgid "Swap usage"
+msgstr "交换空间占用"
+
+msgid "Swap available"
+msgstr "可用交换空间"
+
+msgid "Network interfaces"
+msgstr "网络接口"
+
+msgid "Sent"
+msgstr "发送"
+
+msgid "Received"
+msgstr "接收"
+
+msgid "Send rate"
+msgstr "发送速度"
+
+msgid "Receive rate"
+msgstr "接收速度"
+
+msgid "Filesystems"
+msgstr "文件系统"
+
+msgid "Used"
+msgstr "已用"
+
+msgid "Usage"
+msgstr "占用"
+
+msgid "Available"
+msgstr "可用"
+
+msgid "Mount point"
+msgstr "挂载点"
+
+msgid "OpenSSH / PEM / PuTTY PPK private keys are supported (not .pub files)"
+msgstr "支持 OpenSSH / PEM / PuTTY PPK 私钥（不要选择 .pub 公钥）"
+
+msgid "Jump host"
+msgstr "跳板主机"
+
+msgid "The selected saved SSH session supplies the bastion credentials and host-key policy."
+msgstr "所选 SSH 会话将提供跳板机的凭据和主机密钥策略。"
+
+msgid "Host key policy"
+msgstr "主机密钥策略"
+
+msgid "Ask"
+msgstr "询问"
+
+msgid "Strict"
+msgstr "严格"
+
+msgid "Accept new"
+msgstr "自动接受新密钥"
+
+msgid "Only a matching saved host key is accepted."
+msgstr "只接受与已保存记录完全匹配的主机密钥。"
+
+msgid "New keys are saved automatically; changed keys are rejected."
+msgstr "自动保存首次出现的密钥；拒绝发生变化的密钥。"
+
+msgid "Unknown or changed keys require confirmation."
+msgstr "未知或发生变化的密钥需要手动确认。"
+
+msgid "Connect timeout (s)"
+msgstr "连接超时（秒）"
+
+msgid "Keepalive (s, 0=off)"
+msgstr "保活间隔（秒，0=关闭）"
+
+msgid "Miss limit"
+msgstr "失联次数"
+
+msgid "Initial directory (optional)"
+msgstr "初始目录（可选）"
+
+msgid "Startup command (optional)"
+msgstr "启动命令（可选）"
+
+msgid "Testing…"
+msgstr "测试中…"
+
+msgid "Test connection"
+msgstr "测试连接"

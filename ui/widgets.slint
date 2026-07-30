@@ -69,14 +69,16 @@ export component PrimaryButton inherits Rectangle {
 // --- GhostButton -----------------------------------------------------------
 export component GhostButton inherits Rectangle {
     in property <string> text;
+    in property <bool> enabled: true;
     callback clicked();
 
     height: 30px;
     min-width: 80px;
     border-radius: Theme.radius-sm;
     border-width: 1px;
-    border-color: touch.has-hover ? Theme.border-strong : Theme.border-subtle;
-    background: touch.pressed ? Theme.bg-active
+    opacity: root.enabled ? 1 : 0.55;
+    border-color: touch.has-hover && root.enabled ? Theme.border-strong : Theme.border-subtle;
+    background: touch.pressed && root.enabled ? Theme.bg-active
         : (touch.has-hover ? Theme.bg-hover : Theme.bg-panel);
     animate background, border-color { duration: 120ms; }
 
@@ -93,8 +95,9 @@ export component GhostButton inherits Rectangle {
     }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if (root.enabled) { root.clicked(); } }
     }
 }
 

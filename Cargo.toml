@@ -1,6 +1,6 @@
 [package]
 name = "cloudshell"
-version = "0.4.12"
+version = "0.0.5"
 edition = "2021"
 authors = ["cloudshell contributors"]
 description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"
@@ -47,6 +47,16 @@ zeroize = "1"
 # (HTTP CONNECT proxies are handled in src/proxy.rs without an extra crate.)
 tokio-socks = "0.5"
 base64 = "0.22"
+# PuTTY PPK v2/v3 decoding. PPK v3 derives AES/HMAC material with Argon2;
+# v2 uses SHA-1. Keys are converted in memory into ssh-key/russh keypairs.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+argon2 = "0.5"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+ssh-encoding = "0.2"
 # Enumerate installed system fonts for the Interface (font) settings picker.
 fontdb = "0.16"
 # Cross-platform serial port access for the Serial session type (#14, #17).

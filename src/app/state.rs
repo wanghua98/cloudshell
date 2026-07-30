@@ -51,6 +51,8 @@ pub(crate) struct TabStatus {
     pub(crate) host: String,
     pub(crate) session_id: String,
     pub(crate) state: u8,
+    /// True for SSH sessions that can open auxiliary exec channels.
+    pub(crate) remote_tools: bool,
     pub(crate) cpu: f32,
     pub(crate) mem_used_kib: u64,
     pub(crate) mem_total_kib: u64,

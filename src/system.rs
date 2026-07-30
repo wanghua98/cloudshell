@@ -3,7 +3,7 @@
 //! `sysinfo` is already a dependency for many Rust desktop apps; it gives us
 //! cross-platform data with ~2% CPU overhead at 1-second cadence.
 
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
 
 /// Snapshot passed to the UI each tick.
 #[derive(Debug, Clone, Default)]
@@ -34,8 +34,14 @@ pub struct SystemSampler {
 
 impl SystemSampler {
     pub fn new() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        // This sidebar needs only aggregate CPU, RAM and swap values. `new_all`
+        // also snapshots every process and retains that process table for the
+        // lifetime of the app, wasting startup time and memory.
+        let sys = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(MemoryRefreshKind::everything()),
+        );
         let nets = Networks::new_with_refreshed_list();
         let last_rx_total = nets.values().map(|d| d.total_received()).sum();
         let last_tx_total = nets.values().map(|d| d.total_transmitted()).sum();

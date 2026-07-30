@@ -179,6 +179,9 @@ async fn run_telnet(
                         let _ = wr.write_all(&naws_subneg(cols, rows)).await;
                         let _ = wr.flush().await;
                     }
+                    // Remote process sampling only applies to SSH sessions.
+                    Some(SessionCommand::SetProcessMonitor(_)) => {}
+                    Some(SessionCommand::RequestSystemInfo(_)) => {}
                     Some(SessionCommand::Close) | None => break,
                 }
             }

@@ -1,7 +1,7 @@
 //! Minimal `~/.ssh/config` parser used to import hosts as cloudshell sessions.
 //!
 //! We only read the handful of fields a session needs — `HostName`, `User`,
-//! `Port`, `IdentityFile` — grouped under each concrete `Host` alias.  Wildcard
+//! `Port`, `IdentityFile`, `ProxyJump` — grouped under each concrete `Host` alias. Wildcard
 //! patterns (`Host *`) and unsupported directives are ignored; this is a
 //! convenience importer, not a full ssh_config implementation.
 
@@ -15,6 +15,7 @@ pub struct ImportedHost {
     pub user: String,
     pub port: u16,
     pub identity_file: String,
+    pub proxy_jump: String,
 }
 
 /// Parse the user's `~/.ssh/config` (returns empty if it doesn't exist).
@@ -138,6 +139,7 @@ pub fn parse_str(text: &str, home: &Path) -> Vec<ImportedHost> {
                         user: String::new(),
                         port: 22,
                         identity_file: String::new(),
+                        proxy_jump: String::new(),
                     });
                 }
             }
@@ -165,6 +167,24 @@ pub fn parse_str(text: &str, home: &Path) -> Vec<ImportedHost> {
                     }
                 }
             }
+            "proxyjump" => {
+                if let Some(h) = cur.as_mut() {
+                    // One saved-session hop is supported. OpenSSH's comma-
+                    // separated multi-hop form is intentionally not flattened.
+                    h.proxy_jump = val
+                        .split(',')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .split('@')
+                        .next_back()
+                        .unwrap_or_default()
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
             _ => {}
         }
     }
@@ -186,6 +206,7 @@ Host prod web-prod
     User deploy
     Port 2222
     IdentityFile ~/.ssh/id_ed25519
+    ProxyJump bastion
 
 Host *
     User nobody
@@ -200,6 +221,7 @@ Host alias-only
         assert_eq!(hosts[0].user, "deploy");
         assert_eq!(hosts[0].port, 2222);
         assert!(hosts[0].identity_file.ends_with("/.ssh/id_ed25519"));
+        assert_eq!(hosts[0].proxy_jump, "bastion");
         // alias-only: hostname falls back to the alias
         assert_eq!(hosts[1].alias, "alias-only");
         assert_eq!(hosts[1].hostname, "alias-only");

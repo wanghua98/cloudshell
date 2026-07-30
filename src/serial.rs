@@ -196,6 +196,9 @@ async fn run_serial(
             }
             // A serial line has no window size; nothing to propagate.
             SessionCommand::Resize(_, _) => {}
+            // Remote process sampling only applies to SSH sessions.
+            SessionCommand::SetProcessMonitor(_) => {}
+            SessionCommand::RequestSystemInfo(_) => {}
             SessionCommand::Close => break,
         }
     }
