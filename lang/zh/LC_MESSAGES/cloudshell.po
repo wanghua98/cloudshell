@@ -55,7 +55,7 @@ msgid "About cloudshell"
 msgstr "关于 cloudshell"
 
 msgid "A lightweight Rust + Slint SSH terminal client by 'lil meatball'."
-msgstr "一个由「一坨肉」开发的轻量 Rust + Slint SSH 终端客户端。"
+msgstr "轻量 Rust + Slint SSH 终端客户端。"
 
 msgid "Open source · MIT / Apache-2.0"
 msgstr "开源项目 · 协议 MIT / Apache-2.0"
@@ -328,7 +328,7 @@ msgid "-D: local SOCKS5 proxy"
 msgstr "-D：本地 SOCKS5 代理"
 
 msgid "cloudshell — a lightweight Rust + Slint SSH client by 'lil meatball'"
-msgstr "cloudshell 一个由「一坨肉」开发的轻量 Rust + Slint SSH 客户端"
+msgstr "cloudshell 轻量 Rust + Slint SSH 客户端"
 
 msgid "Quick connect"
 msgstr "快速连接"
