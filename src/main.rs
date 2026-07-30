@@ -19,6 +19,16 @@ mod telnet;
 mod zmodem;
 
 fn main() -> anyhow::Result<()> {
+    // Keep release automation and diagnostics from having to instantiate the
+    // GUI just to read the package version.
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("cloudshell {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // macOS renderer is left at Slint's default (femtovg) and is NOT forced.
     //
     // History: 0.4.10 force-set SLINT_BACKEND=winit-skia to work around femtovg's
