@@ -136,8 +136,7 @@ async fn connect_http(cfg: &ProxyConfig, host: &str, port: u16) -> Result<TcpStr
 
     let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
     if let Some((u, p)) = &cfg.auth {
-        let token =
-            base64::engine::general_purpose::STANDARD.encode(format!("{u}:{}", p.as_str()));
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{}", p.as_str()));
         req.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
     }
     req.push_str("Proxy-Connection: keep-alive\r\n\r\n");

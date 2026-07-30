@@ -1,4 +1,4 @@
-# meatshell
+# cloudshell
 
 [简体中文](./README.md) | **English**
 
@@ -24,18 +24,18 @@ the tens-of-MB range of a native binary.
 
 Every `v*` tag triggers a GitHub Actions build that produces native binaries for
 **Windows / Linux / macOS**, published on the
-[Releases](https://github.com/jeff141/meatshell/releases) page.
+[Releases](https://github.com/jeff141/cloudshell/releases) page.
 
 ### Windows
 
-Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`.
+Download `cloudshell-*-windows-x86_64.zip`, unzip, and run `cloudshell.exe`.
 
 ### Linux
 
 ```bash
-tar -xzf meatshell-*-linux-x86_64.tar.gz
-cd meatshell-*-linux-x86_64
-./meatshell                                  # run it directly
+tar -xzf cloudshell-*-linux-x86_64.tar.gz
+cd cloudshell-*-linux-x86_64
+./cloudshell                                  # run it directly
 # Optional: install the app icon + launcher entry (shows the icon in the dock /
 # app list — no argument needed, it finds the binary next to the script)
 chmod +x install-linux.sh && ./install-linux.sh
@@ -47,9 +47,9 @@ chmod +x install-linux.sh && ./install-linux.sh
 ### macOS
 
 ```bash
-tar -xzf meatshell-*-macos-*.tar.gz          # aarch64 = Apple Silicon, x86_64 = Intel
-xattr -dr com.apple.quarantine meatshell     # clear the "unsigned app" Gatekeeper flag
-./meatshell
+tar -xzf cloudshell-*-macos-*.tar.gz          # aarch64 = Apple Silicon, x86_64 = Intel
+xattr -dr com.apple.quarantine cloudshell     # clear the "unsigned app" Gatekeeper flag
+./cloudshell
 ```
 
 > To build from source, see [Running](#running) below.
@@ -64,9 +64,9 @@ xattr -dr com.apple.quarantine meatshell     # clear the "unsigned app" Gatekeep
 - [x] Full VT/ANSI terminal emulation (btop / htop / vim render correctly)
 - [x] Tabs (welcome page + multiple sessions)
 - [x] Session management: create / edit / delete / groups, local JSON, export / import
-  - Config location: `%APPDATA%/meatshell/sessions.json` (Windows)
-    / `~/.config/meatshell/sessions.json` (Linux)
-    / `~/Library/Application Support/meatshell/sessions.json` (macOS)
+  - Config location: `%APPDATA%/cloudshell/sessions.json` (Windows)
+    / `~/.config/cloudshell/sessions.json` (Linux)
+    / `~/Library/Application Support/cloudshell/sessions.json` (macOS)
 - [x] SSH (`russh`, pure Rust): password / private key / encrypted key (passphrase)
 - [x] SFTP browser + upload / download (drag-and-drop) + in-terminal ZMODEM (`sz`) receive
 - [x] SSH port forwarding / tunnels: local -L / remote -R / dynamic -D (SOCKS5)
@@ -100,13 +100,13 @@ cargo run --release
 ```
 
 On first launch an empty session store is created at
-`%APPDATA%/meatshell/sessions.json`. Click **"＋ New Session"** in the top-right
+`%APPDATA%/cloudshell/sessions.json`. Click **"＋ New Session"** in the top-right
 to add your first server.
 
 ## Project layout
 
 ```
-meatshell/
+cloudshell/
 ├── Cargo.toml
 ├── build.rs                 # Slint compiler entry point
 ├── ui/

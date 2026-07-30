@@ -50,16 +50,16 @@ All notable changes are documented here. 本文件记录所有重要变更。
   renderer (0.4.11's femtovg revert alone didn't help) nor font *loading* (fontdb
   loaded 900+ faces). The UI now prefers the reliably-rendering "Heiti SC" (a clean
   sans-serif that ships on every macOS), with STHeiti/Songti as further fallbacks
-  and the embedded "Meatshell Mono" as a last resort so the window is never blank.
-  A `MEATSHELL_UI_FONT="<family>"` env var can force any family without a rebuild.
+  and the embedded "Cloudshell Mono" as a last resort so the window is never blank.
+  A `CLOUDSHELL_UI_FONT="<family>"` env var can force any family without a rebuild.
   **修复 macOS 26 文字全白——默认中文界面字体改用 femtovg 能渲染的字体 (#129, #108)。**
   根因最终定位:部分 macOS 26 机器上 femtovg 无法栅格化*新版*系统中文字体(PingFang
   SC、Hiragino)——fontdb 能找到它们,但每个字形都画成空白;而老字体
   Heiti/STHeiti/Songti 渲染完全正常(已在 M2 / macOS 26 上逐字体实测)。既不是渲染器
   (0.4.11 单独退回 femtovg 没用),也不是字体*加载*(fontdb 加载了 900+ 个 face)。
   界面现在优先用稳定渲染的「Heiti SC」(所有 macOS 自带的干净黑体),STHeiti/Songti
-  作为后备,内置「Meatshell Mono」兜底,确保窗口永不全白。可用环境变量
-  `MEATSHELL_UI_FONT="<字体名>"` 免重编强制指定任意字体。
+  作为后备,内置「Cloudshell Mono」兜底,确保窗口永不全白。可用环境变量
+  `CLOUDSHELL_UI_FONT="<字体名>"` 免重编强制指定任意字体。
 
 ## [0.4.11] - 2026-06-20
 
@@ -219,10 +219,10 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 - **htop/btop box-drawing and braille no longer render as tofu** on machines
   without Cascadia Mono installed (e.g. Win11 Home). The embedded font is now a
-  uniquely-named family ("Meatshell Mono") so the OS can't substitute a
+  uniquely-named family ("Cloudshell Mono") so the OS can't substitute a
   glyph-poor fallback for it. (#114)
   **htop/btop 的线框和盲文字符不再显示为方块**(在未安装 Cascadia Mono 的机器上,
-  如 Win11 家庭版)。内嵌字体改用独一无二的族名「Meatshell Mono」,系统无法再用
+  如 Win11 家庭版)。内嵌字体改用独一无二的族名「Cloudshell Mono」,系统无法再用
   缺字形的字体顶替它。
 - **The injected setup line no longer leaks to the terminal on connect**, even
   when it wraps across the terminal width. Output is buffered until the hook's
@@ -742,12 +742,12 @@ All notable changes are documented here. 本文件记录所有重要变更。
   `wayland-data-control` 后端,复制改用 set().wait() 使选区在剪贴板句柄 drop 后
   仍然有效。
 
-- **Hide the shell-integration command from the terminal.** meatshell injects a
+- **Hide the shell-integration command from the terminal.** cloudshell injects a
   one-line `PROMPT_COMMAND` (OSC 7) on connect so the SFTP panel can follow the
   terminal's working directory. Its echo used to show up on every connect (and
   pollute shell history); the line now carries a leading space (kept out of
   history) and its echo is stripped from the output before display.
-  **隐藏 shell 集成注入命令。** meatshell 连接时会注入一行 `PROMPT_COMMAND`
+  **隐藏 shell 集成注入命令。** cloudshell 连接时会注入一行 `PROMPT_COMMAND`
   (OSC 7),让 SFTP 面板跟随终端当前目录。此前它的回显每次连接都显示在终端
   (并污染命令历史);现在该行带前导空格(不进历史),回显也会在显示前被剥离。
 
@@ -856,10 +856,10 @@ All notable changes are documented here. 本文件记录所有重要变更。
   switched to an ASCII `+`.
   英文下「New session」前的全角 `＋` 显示为豆腐块,改用 ASCII `+`。
 
-- `install-linux.sh` now auto-detects the `meatshell` binary sitting next to it
+- `install-linux.sh` now auto-detects the `cloudshell` binary sitting next to it
   in a release package, so it works with no arguments (it previously defaulted to
   the source-tree `./target/release` path and failed for end users).
-  `install-linux.sh` 现在自动识别发布包里同目录的 `meatshell`,无需传参即可使用
+  `install-linux.sh` 现在自动识别发布包里同目录的 `cloudshell`,无需传参即可使用
   (之前默认指向源码树的 `./target/release`,普通用户直接跑会报错)。
 
 ## [0.2.2] - 2026-06-05
@@ -902,18 +902,18 @@ All notable changes are documented here. 本文件记录所有重要变更。
   **会话弹窗的私钥文件选择器**，并支持 `.pub` 容错（自动去后缀加载对应私钥）、
   路径分隔符统一为 `/`。
 
-- **Linux desktop integration** — `assets/meatshell.desktop` + `install-linux.sh`
+- **Linux desktop integration** — `assets/cloudshell.desktop` + `install-linux.sh`
   and an `xdg_app_id` so the GNOME/Ubuntu dock shows the app icon on Wayland.
-  **Linux 桌面集成** —— `assets/meatshell.desktop` + `install-linux.sh`，并设置
+  **Linux 桌面集成** —— `assets/cloudshell.desktop` + `install-linux.sh`，并设置
   `xdg_app_id`，使 Wayland 下 GNOME/Ubuntu 任务栏显示应用图标。
 
 - **Screenshots in the README** (`docs/screenshots/`, sensitive info redacted).
   **README 增加截图**（`docs/screenshots/`，敏感信息已打码）。
 
-[0.3.8]: https://github.com/jeff141/meatshell/releases/tag/v0.3.8
-[0.3.7]: https://github.com/jeff141/meatshell/releases/tag/v0.3.7
-[0.3.3]: https://github.com/jeff141/meatshell/releases/tag/v0.3.3
-[0.3.2]: https://github.com/jeff141/meatshell/releases/tag/v0.3.2
-[0.3.1]: https://github.com/jeff141/meatshell/releases/tag/v0.3.1
-[0.3.0]: https://github.com/jeff141/meatshell/releases/tag/v0.3.0
-[0.2.2]: https://github.com/jeff141/meatshell/releases/tag/v0.2.2
+[0.3.8]: https://github.com/jeff141/cloudshell/releases/tag/v0.3.8
+[0.3.7]: https://github.com/jeff141/cloudshell/releases/tag/v0.3.7
+[0.3.3]: https://github.com/jeff141/cloudshell/releases/tag/v0.3.3
+[0.3.2]: https://github.com/jeff141/cloudshell/releases/tag/v0.3.2
+[0.3.1]: https://github.com/jeff141/cloudshell/releases/tag/v0.3.1
+[0.3.0]: https://github.com/jeff141/cloudshell/releases/tag/v0.3.0
+[0.2.2]: https://github.com/jeff141/cloudshell/releases/tag/v0.2.2

@@ -20,7 +20,7 @@ use crate::ssh::{ClientHandler, SessionEvent};
 
 /// Emit a one-line notice into the terminal output stream.
 fn notice(events: &UnboundedSender<SessionEvent>, msg: String) {
-    let _ = events.send(SessionEvent::Output(format!("\r\n[meatshell] {msg}\r\n")));
+    let _ = events.send(SessionEvent::Output(format!("\r\n[cloudshell] {msg}\r\n")));
 }
 
 fn bind_target(bind_addr: &str, bind_port: u16) -> String {
@@ -90,7 +90,10 @@ pub fn spawn_local(
                         let mut stream = ch.into_stream();
                         let _ = copy_bidirectional(&mut inbound, &mut stream).await;
                     }
-                    Err(e) => notice(&ev, format!("-L {host}:{target_port} 连接失败 / open failed: {e}")),
+                    Err(e) => notice(
+                        &ev,
+                        format!("-L {host}:{target_port} 连接失败 / open failed: {e}"),
+                    ),
                 }
             });
         }

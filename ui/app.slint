@@ -2,7 +2,7 @@
 // Embedding means Windows / Linux / macOS all render the same glyphs without
 // relying on Consolas / Segoe MDL2 Assets being installed.
 //
-// "Meatshell Mono" is Cascadia Mono re-named to a unique family (#114): full
+// "Cloudshell Mono" is Cascadia Mono re-named to a unique family (#114): full
 //   box-drawing + block-elements + braille (needed by htop/btop graphs). The
 //   original "Cascadia Mono" name collides with the system font family, so on a
 //   machine without Cascadia installed (e.g. Win11 Home) the OS font matcher
@@ -10,8 +10,8 @@
 //   name (like Material Icons) can't be shadowed, so the embedded font is always
 //   used.
 // Material Icons: open-source icon font replacing Windows-only Segoe MDL2 Assets.
-import "fonts/MeatshellMono-Regular.ttf";
-import "fonts/MeatshellMono-Bold.ttf";
+import "fonts/CloudshellMono-Regular.ttf";
+import "fonts/CloudshellMono-Bold.ttf";
 import "fonts/MaterialIcons-Regular.ttf";
 
 import { Theme } from "theme.slint";
@@ -185,7 +185,7 @@ component ShortcutRow inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    title: "meatshell";
+    title: "cloudshell";
     icon: @image-url("../assets/icon.png");
     // Frameless when we draw our own title bar (#119); Rust sets custom-titlebar
     // true on Windows/Linux. Slint maps no-frame → winit set_decorations(false).
@@ -560,7 +560,7 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     alignment: center;
                     Text {
-                        text: "meatshell";
+                        text: "cloudshell";
                         color: Theme.text-secondary;
                         font-size: Theme.fs-sm;
                     }
@@ -2162,7 +2162,7 @@ export component AppWindow inherits Window {
                 padding: 18px;
                 spacing: 12px;
                 Text {
-                    text: root.lang-en ? "Close meatshell?" : "确定关闭 meatshell?";
+                    text: root.lang-en ? "Close cloudshell?" : "确定关闭 cloudshell?";
                     color: Theme.text-primary; font-size: Theme.fs-lg; font-weight: 700;
                 }
                 Text {
@@ -2549,7 +2549,7 @@ export component AppWindow inherits Window {
                                 border-color: Theme.border-subtle;
                                 Text {
                                     x: 10px;
-                                    text: "meatshell ~$ echo preview 0123";
+                                    text: "cloudshell ~$ echo preview 0123";
                                     font-family: Theme.term-font-family;
                                     font-size: Theme.term-font-size;
                                     color: Theme.term-fg;
@@ -2772,7 +2772,7 @@ export component AppWindow inherits Window {
 
                 HorizontalLayout {
                     Text {
-                        text: @tr("About meatshell");
+                        text: @tr("About cloudshell");
                         color: Theme.text-primary;
                         font-size: Theme.fs-lg;
                         font-weight: 700;

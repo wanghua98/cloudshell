@@ -1,4 +1,4 @@
-//! Minimal `~/.ssh/config` parser used to import hosts as meatshell sessions.
+//! Minimal `~/.ssh/config` parser used to import hosts as cloudshell sessions.
 //!
 //! We only read the handful of fields a session needs — `HostName`, `User`,
 //! `Port`, `IdentityFile` — grouped under each concrete `Host` alias.  Wildcard
@@ -220,8 +220,7 @@ Host scheme
     HostName http://x.com
 ";
         let home = Path::new("/home/me");
-        let aliases: Vec<String> =
-            parse_str(cfg, home).into_iter().map(|h| h.alias).collect();
+        let aliases: Vec<String> = parse_str(cfg, home).into_iter().map(|h| h.alias).collect();
         assert!(aliases.contains(&"good".to_string()));
         assert!(aliases.contains(&"ipv6".to_string()));
         assert!(!aliases.contains(&"evil".to_string()));

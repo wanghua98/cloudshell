@@ -80,9 +80,8 @@ fn init_tracing() {
         f
     }
 
-    let env_filter = quiet_noise(
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-    );
+    let env_filter =
+        quiet_noise(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(env_filter);

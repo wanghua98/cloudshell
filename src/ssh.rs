@@ -145,7 +145,7 @@ fn extract_osc7_end(text: &str) -> Option<(String, usize)> {
     None
 }
 
-/// Find a meatshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
+/// Find a cloudshell command-capture sequence (`ESC ] 697 ; <command> BEL|ST`)
 /// emitted by the shell hook (#113). Returns the command text and the byte
 /// range of the whole escape sequence, so the caller can strip it before the
 /// text is rendered. An incomplete sequence (terminator not yet received)
@@ -235,9 +235,7 @@ pub enum SessionCommand {
 /// enclosing [`SessionEvent`] stays `Clone` (a bare `oneshot::Sender` is not);
 /// the first `respond` consumes the sender, later calls are no-ops.
 #[derive(Clone)]
-pub struct HostKeyResponder(
-    Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>,
-);
+pub struct HostKeyResponder(Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>);
 
 impl HostKeyResponder {
     pub fn new(tx: tokio::sync::oneshot::Sender<bool>) -> Self {
@@ -471,7 +469,9 @@ async fn run_session(
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}:{} ...",
         t("连接中", "Connecting"),
-        session.user, session.host, session.port
+        session.user,
+        session.host,
+        session.port
     )));
 
     let config = Arc::new(client::Config {
@@ -520,7 +520,9 @@ async fn run_session(
     let (user, password) = match resolve_credentials(&session, &events).await {
         Some(c) => c,
         None => {
-            let _ = events.send(SessionEvent::Closed(t("已取消登录", "login cancelled").into()));
+            let _ = events.send(SessionEvent::Closed(
+                t("已取消登录", "login cancelled").into(),
+            ));
             let _ = handle
                 .disconnect(Disconnect::ByApplication, "cancelled", "")
                 .await;
@@ -569,7 +571,9 @@ async fn run_session(
 
     if !authed {
         tracing::warn!("ssh authentication failed for {}@{}", user, session.host);
-        let _ = events.send(SessionEvent::Closed(t("认证失败", "authentication failed").into()));
+        let _ = events.send(SessionEvent::Closed(
+            t("认证失败", "authentication failed").into(),
+        ));
         let _ = handle
             .disconnect(Disconnect::ByApplication, "auth failed", "")
             .await;
@@ -600,7 +604,8 @@ async fn run_session(
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}",
         t("已连接", "Connected"),
-        session.user, session.host
+        session.user,
+        session.host
     )));
 
     // Whether we have already injected the PROMPT_COMMAND setup.
@@ -702,13 +707,13 @@ async fn run_session(
         match handle.tcpip_forward(bind.clone(), f.bind_port as u32).await {
             Ok(_) => {
                 let _ = events.send(SessionEvent::Output(format!(
-                    "\r\n[meatshell] -R {bind}:{} → {}:{}\r\n",
+                    "\r\n[cloudshell] -R {bind}:{} → {}:{}\r\n",
                     f.bind_port, f.host, f.host_port
                 )));
             }
             Err(e) => {
                 let _ = events.send(SessionEvent::Output(format!(
-                    "\r\n[meatshell] -R {bind}:{} 请求失败 / request failed: {e}\r\n",
+                    "\r\n[cloudshell] -R {bind}:{} 请求失败 / request failed: {e}\r\n",
                     f.bind_port
                 )));
             }
@@ -792,9 +797,9 @@ async fn run_session(
                                     tracing::warn!("zmodem receive failed: {e:#}");
                                     let _ = channel.data(&ZMODEM_CANCEL[..]).await;
                                     let _ = events.send(SessionEvent::Output(format!(
-                                        "\r\n[meatshell] {}: {e}\r\n",
+                                        "\r\n[cloudshell] {}: {e}\r\n",
                                         t("ZMODEM 接收失败,已取消", "ZMODEM receive failed; cancelled")
-                                    ).into()));
+                                    )));
                                 }
                             }
                             continue;
@@ -943,7 +948,9 @@ async fn run_session(
     // The shell pump loop only exits when the channel closes / EOFs (incl. a
     // peer/bastion-initiated disconnect), so record it for #86 diagnostics.
     tracing::warn!("ssh connection closed ({}@{})", session.user, session.host);
-    let _ = events.send(SessionEvent::Closed(t("连接已关闭", "connection closed").into()));
+    let _ = events.send(SessionEvent::Closed(
+        t("连接已关闭", "connection closed").into(),
+    ));
     Ok(())
 }
 
@@ -1060,7 +1067,7 @@ fn parse_monitor_block(
         }
         *prev_net_at = now;
         // Show busiest first so the default-selected NIC is the active one.
-        net.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        net.sort_by_key(|entry| std::cmp::Reverse(entry.1 + entry.2));
     }
 
     let cpu_percent = if have_cpu {
@@ -1138,7 +1145,11 @@ fn parse_df_line(line: &str) -> Option<(String, u64, u64)> {
     let mount = f[5..].join(" ");
     // Saturating: a server can report arbitrary block counts; KiB→bytes must
     // not overflow-panic in debug (#27).
-    Some((mount, avail_kb.saturating_mul(1024), total_kb.saturating_mul(1024)))
+    Some((
+        mount,
+        avail_kb.saturating_mul(1024),
+        total_kb.saturating_mul(1024),
+    ))
 }
 
 /// Extract the leading integer (KiB) from a `/proc/meminfo` value like
@@ -1234,8 +1245,7 @@ pub(crate) async fn resolve_credentials(
     let mut user = session.user.trim().to_string();
     let mut password = session.password.as_str().to_string();
     let need_user = user.is_empty();
-    let need_password =
-        matches!(session.auth, AuthMethod::Password) && password.is_empty();
+    let need_password = matches!(session.auth, AuthMethod::Password) && password.is_empty();
     if !(need_user || need_password) {
         return Some((user, password));
     }
@@ -1312,7 +1322,7 @@ impl Handler for ClientHandler {
                 }
                 Err(e) => {
                     let _ = events.send(SessionEvent::Output(format!(
-                        "\r\n[meatshell] -R {host}:{port} 连接失败 / connect failed: {e}\r\n"
+                        "\r\n[cloudshell] -R {host}:{port} 连接失败 / connect failed: {e}\r\n"
                     )));
                 }
             }
@@ -1378,9 +1388,8 @@ mod monitor_hardening_tests {
     #[test]
     fn cpu_overflow_values_do_not_panic() {
         let big = u64::MAX;
-        let block = format!(
-            "cpu {big} {big} {big} {big} {big}\nMemTotal: 1000 kB\nMemAvailable: 500 kB"
-        );
+        let block =
+            format!("cpu {big} {big} {big} {big} {big}\nMemTotal: 1000 kB\nMemAvailable: 500 kB");
         let mut prev = None;
         let mut prev_net = HashMap::new();
         let mut at = Instant::now();

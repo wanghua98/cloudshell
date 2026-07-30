@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 /// `<config_dir>/error.log`, next to `sessions.json`.
 pub fn path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("dev", "meatshell", "meatshell")?;
+    let dirs = directories::ProjectDirs::from("dev", "cloudshell", "cloudshell")?;
     let dir = dirs.config_dir().to_path_buf();
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join("error.log"))

@@ -48,8 +48,14 @@ pub fn spawn_telnet_session(
 
     let evt_for_task = evt_tx.clone();
     let join = runtime.spawn(async move {
-        if let Err(err) =
-            run_telnet(session, cmd_rx, evt_for_task.clone(), initial_cols, initial_rows).await
+        if let Err(err) = run_telnet(
+            session,
+            cmd_rx,
+            evt_for_task.clone(),
+            initial_cols,
+            initial_rows,
+        )
+        .await
         {
             let _ = evt_for_task.send(SessionEvent::Closed(format!("{err:#}")));
         }
@@ -69,9 +75,9 @@ pub fn spawn_telnet_session(
 enum TnState {
     Data,
     Iac,
-    Opt(u8),     // saw IAC <DO/DONT/WILL/WONT>, awaiting option byte
-    Sub,         // inside subnegotiation, awaiting IAC
-    SubIac,      // inside subnegotiation, saw IAC (awaiting SE)
+    Opt(u8), // saw IAC <DO/DONT/WILL/WONT>, awaiting option byte
+    Sub,     // inside subnegotiation, awaiting IAC
+    SubIac,  // inside subnegotiation, saw IAC (awaiting SE)
 }
 
 fn naws_subneg(cols: u32, rows: u32) -> Vec<u8> {
@@ -79,7 +85,12 @@ fn naws_subneg(cols: u32, rows: u32) -> Vec<u8> {
     let h = (rows.clamp(1, u16::MAX as u32)) as u16;
     let mut v = vec![IAC, SB, OPT_NAWS];
     // Width / height are 16-bit; any 255 byte inside must be doubled.
-    for b in [(w >> 8) as u8, (w & 0xff) as u8, (h >> 8) as u8, (h & 0xff) as u8] {
+    for b in [
+        (w >> 8) as u8,
+        (w & 0xff) as u8,
+        (h >> 8) as u8,
+        (h & 0xff) as u8,
+    ] {
         v.push(b);
         if b == IAC {
             v.push(IAC);

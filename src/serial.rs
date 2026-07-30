@@ -118,7 +118,13 @@ async fn run_serial(
     })
     .await
     .context("serial open task panicked")?
-    .with_context(|| format!("{} {}", t("打开串口失败", "failed to open serial port"), port_name))?;
+    .with_context(|| {
+        format!(
+            "{} {}",
+            t("打开串口失败", "failed to open serial port"),
+            port_name
+        )
+    })?;
 
     // A second handle for writing so the reader thread can own the read side.
     let writer = port

@@ -37,7 +37,7 @@ fn id(host: &str, port: u16) -> String {
 /// Path to the known_hosts file (alongside sessions.json). `None` if the user
 /// config directory can't be determined.
 fn path() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("dev", "meatshell", "meatshell")?;
+    let dirs = ProjectDirs::from("dev", "cloudshell", "cloudshell")?;
     Some(dirs.config_dir().join("known_hosts"))
 }
 
@@ -47,8 +47,7 @@ fn openssh_line(key: &PublicKey) -> String {
     // `to_openssh` only fails on an unsupported/!encodable key, which russh
     // would not have negotiated; fall back to the SHA256 fingerprint so a
     // freak case still stores *something* stable rather than panicking.
-    key.to_openssh()
-        .unwrap_or_else(|_| fingerprint(key))
+    key.to_openssh().unwrap_or_else(|_| fingerprint(key))
 }
 
 /// Human-readable SHA256 fingerprint (`SHA256:base64…`) shown in the dialog.

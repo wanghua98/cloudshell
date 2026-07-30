@@ -5,20 +5,20 @@
 <dict>
     <!-- The executable inside Contents/MacOS/ -->
     <key>CFBundleExecutable</key>
-    <string>meatshell</string>
+    <string>cloudshell</string>
 
-    <!-- Points to Contents/Resources/meatshell.icns (no extension) -->
+    <!-- Points to Contents/Resources/cloudshell.icns (no extension) -->
     <key>CFBundleIconFile</key>
-    <string>meatshell</string>
+    <string>cloudshell</string>
 
     <key>CFBundleIdentifier</key>
-    <string>dev.meatshell.meatshell</string>
+    <string>dev.cloudshell.cloudshell</string>
 
     <key>CFBundleName</key>
-    <string>meatshell</string>
+    <string>cloudshell</string>
 
     <key>CFBundleDisplayName</key>
-    <string>meatshell</string>
+    <string>cloudshell</string>
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>
@@ -39,6 +39,6 @@
     <string>11.0</string>
 
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2024 meatshell contributors. MIT OR Apache-2.0.</string>
+    <string>Copyright © 2024 cloudshell contributors. MIT OR Apache-2.0.</string>
 </dict>
 </plist>

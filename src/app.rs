@@ -11,58 +11,20 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-/// Per-terminal state: vt100 parser drives all rendering for both normal
-/// (bash) and alt-screen (vim/nano/htop) modes.
-///
-/// Using vt100 for normal mode too is necessary because readline rewrites the
-/// current input line using `\r` + full-line redraw + `\x1b[K` (erase to EOL)
-/// whenever the cursor moves. A naive append-only buffer would duplicate the
-/// text; vt100 tracks cursor position and overwrites in place correctly.
-struct TermBuffer {
-    parser: vt100::Parser,
-    /// Active find query for this tab ("" = no search).
-    find_query: String,
-    /// Current theme mode — propagated from the global dark-mode toggle.
-    /// Stored here so the event-pump threads can render new output with the
-    /// correct palette without needing a window reference.
-    is_dark: bool,
-    /// Drag selection in ABSOLUTE scrollback coordinates: each endpoint is a
-    /// `(combined_row, col)` where `combined_row` indexes the virtual buffer of
-    /// `history` lines followed by the live screen rows.  Absolute (rather than
-    /// visible-window) coordinates keep the selection pinned to its content
-    /// while the view auto-scrolls during a drag, so a top-to-bottom selection
-    /// across more than one screen of scrollback copies every line (#18).
-    /// `anchor` = where the drag began, `focus` = the moving end.
-    sel_anchor: Option<(usize, u16)>,
-    sel_focus: Option<(usize, u16)>,
-    /// Session scrollback: lines that have scrolled off the top (oldest first).
-    history: Vec<Line>,
-    /// Previous frame's grid lines, for scroll-off detection.
-    prev: Vec<Line>,
-    /// Scrollback view offset in lines (0 = live bottom).
-    view_offset: usize,
-    /// Plain text of the rows currently displayed (drives find + selection).
-    displayed_text: Vec<String>,
-    /// CSI-scanner state for rewriting HVP (`ESC [ … f`) into CUP (`ESC [ … H`).
-    /// vt100 0.15 only implements the `H` final byte, not the equivalent `f`
-    /// that btop/htop use for cursor positioning — without this rewrite their
-    /// absolute-positioned full-screen output collapses into a scrolling mess.
-    /// Kept here so a sequence split across read chunks is still translated.
-    csi_state: CsiState,
-}
+mod models;
+mod state;
+mod terminal;
 
-/// Minimal CSI-final-byte rewriter state (persists across read chunks).
-#[derive(Clone, Copy, PartialEq)]
-enum CsiState {
-    /// Normal text.
-    Normal,
-    /// Saw ESC (0x1b), waiting to see if it starts a CSI (`[`).
-    Esc,
-    /// Inside a CSI sequence (after `ESC [`), scanning params/intermediates.
-    Csi,
-}
-
-type TermBuffers = Arc<Mutex<HashMap<String, TermBuffer>>>;
+use models::{
+    all_quick_group_names, clear_sftp_selection, disk_model, find_matches as compute_find_matches,
+    forward_model, history_model, history_view_model, normalized_history as normalized_model,
+    proc_model, quick_cmd_model, selected_sftp_paths as collect_sftp_selected,
+};
+use state::{
+    CsiState, Line, LocalSnap, SftpHandles, SftpLastCwd, TabStatus, TabStatuses, TermBuffer,
+    TermBuffers,
+};
+use terminal::{key_to_pty_bytes, normalize_pasted_newlines, parent_path};
 
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
@@ -71,49 +33,11 @@ use tokio::runtime::Runtime;
 
 use crate::config::{AuthMethod, ConfigStore, Secret, Session, SessionKind};
 use crate::i18n::t;
-use crate::sftp::{spawn_sftp, SftpHandle};
+use crate::sftp::spawn_sftp;
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent,
-    SessionHandle,
+    format_mtime, format_size, spawn_session, SessionCommand, SessionEvent, SessionHandle,
 };
 use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
-
-type SftpHandles = Arc<Mutex<HashMap<String, SftpHandle>>>;
-/// Per-tab flag: once the user explicitly navigates via the SFTP tree or
-/// toolbar, stop auto-syncing to the terminal's `cd` path.
-/// Per-tab last cwd the SFTP panel followed (from OSC 7). Used to ignore the
-/// OSC 7 every prompt re-emits at an unchanged directory; manual SFTP
-/// navigation REMOVES the entry so the very next OSC 7 — same directory or
-/// not — snaps the panel back to the shell's cwd (cd-follow never goes stale).
-type SftpLastCwd = Arc<Mutex<HashMap<String, String>>>;
-
-/// Per-tab connection status + latest remote resource sample, used to drive the
-/// sidebar for whichever tab is active.  `Arc<Mutex>` because the SSH event-pump
-/// threads update it before bouncing to the UI thread.
-#[derive(Clone, Default)]
-struct TabStatus {
-    host: String,       // "root@192.168.100.2"
-    session_id: String, // saved-session id, used to reconnect in place (#79)
-    state: u8,          // 0 = connecting, 1 = connected, 2 = disconnected
-    cpu: f32,     // 0.0..1.0
-    mem_used_kib: u64,
-    mem_total_kib: u64,
-    swap_used_kib: u64,
-    swap_total_kib: u64,
-    /// Latest per-interface rates: (name, rx_bps, tx_bps), busiest first.
-    net: Vec<(String, u64, u64)>,
-    /// Which interface drives the top sparkline (empty = auto = busiest).
-    selected_iface: String,
-    /// Ring buffer of the selected interface's total (rx+tx) bytes/sec.
-    net_hist: Vec<f32>,
-    /// Per-filesystem (mount, available_bytes, total_bytes).
-    disks: Vec<(String, u64, u64)>,
-    /// Top remote processes by CPU, for the process monitor popup (#23).
-    procs: Vec<ProcInfo>,
-}
-type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
-/// Last local-machine sample (shown on the welcome tab).
-type LocalSnap = Arc<Mutex<SystemSnapshot>>;
 
 // Slint generates types into this scope.
 slint::include_modules!();
@@ -141,18 +65,22 @@ const NET_HISTORY_LEN: usize = 60;
 fn set_window_icon(window: &AppWindow) {
     use i_slint_backend_winit::winit::window::Icon;
     const ICON_PNG: &[u8] = include_bytes!("../assets/icon@512.png");
-    let Ok(img) = image::load_from_memory(ICON_PNG) else { return };
+    let Ok(img) = image::load_from_memory(ICON_PNG) else {
+        return;
+    };
     let rgba = img.into_rgba8();
     let (w, h) = rgba.dimensions();
-    let Ok(icon) = Icon::from_rgba(rgba.into_raw(), w, h) else { return };
-    window.window().with_winit_window(|ww| ww.set_window_icon(Some(icon)));
+    let Ok(icon) = Icon::from_rgba(rgba.into_raw(), w, h) else {
+        return;
+    };
+    window
+        .window()
+        .with_winit_window(|ww| ww.set_window_icon(Some(icon)));
 }
 
 pub fn run() -> Result<()> {
     // --- Runtime + store -------------------------------------------------
-    let runtime = Arc::new(
-        Runtime::new().context("failed to start tokio runtime")?,
-    );
+    let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
     let store = Rc::new(RefCell::new(
         ConfigStore::load().context("failed to load config")?,
     ));
@@ -183,9 +111,9 @@ pub fn run() -> Result<()> {
     // --- Build window + models ------------------------------------------
     // Set the Wayland app_id / X11 WM_CLASS *before* the window is created so
     // the Linux desktop shell can match the running window to the installed
-    // `meatshell.desktop` entry and show our icon in the dock/taskbar.  (On
+    // `cloudshell.desktop` entry and show our icon in the dock/taskbar.  (On
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
-    let _ = slint::set_xdg_app_id("meatshell");
+    let _ = slint::set_xdg_app_id("cloudshell");
     let window = AppWindow::new().context("failed to build Slint window")?;
 
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
@@ -216,10 +144,10 @@ pub fn run() -> Result<()> {
     {
         let is_dark = match store.borrow().theme_pref() {
             "light" => false,
-            "dark"  => true,
-            _       => match dark_light::detect() {
-                dark_light::Mode::Light   => false,
-                dark_light::Mode::Dark    => true,
+            "dark" => true,
+            _ => match dark_light::detect() {
+                dark_light::Mode::Light => false,
+                dark_light::Mode::Dark => true,
                 dark_light::Mode::Default => true, // undetectable → dark
             },
         };
@@ -245,11 +173,13 @@ pub fn run() -> Result<()> {
     // failed to register "PingFang SC", so the UI default font resolved to nothing
     // and *all* text vanished (#129) — icons survived only because they use an
     // embedded font. Instead probe what fontdb actually loaded and pick the first
-    // resolvable CJK family, falling back to the embedded "Meatshell Mono" so the
+    // resolvable CJK family, falling back to the embedded "Cloudshell Mono" so the
     // window is never fully blank even when the system font DB is unreadable.
     window.set_ui_font_family(resolve_ui_font_family());
     // Populate the Interface font picker with installed monospace families.
-    window.set_term_fonts(ModelRc::from(Rc::new(VecModel::from(system_monospace_fonts()))));
+    window.set_term_fonts(ModelRc::from(Rc::new(VecModel::from(
+        system_monospace_fonts(),
+    ))));
 
     // Command bar (#55): seed quick commands + history from the config. Groups
     // start collapsed by default (#55).
@@ -406,23 +336,23 @@ pub fn run() -> Result<()> {
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
 
     // --- Wire callbacks --------------------------------------------------
-    wire_session_callbacks(
-        &window,
-        store.clone(),
-        sessions_model.clone(),
-        tabs_model.clone(),
-        terminals_model.clone(),
-        handles.clone(),
-        bufs.clone(),
-        runtime.clone(),
-        last_term_size.clone(),
-        sftp_handles.clone(),
-        sftp_last_cwd.clone(),
-        tab_statuses.clone(),
-        local_snap.clone(),
-        local_net_hist.clone(),
-        sftp_follow_cd.clone(),
-    );
+    let session_callback_ctx = SessionCallbackCtx {
+        store: store.clone(),
+        sessions_model: sessions_model.clone(),
+        tabs_model: tabs_model.clone(),
+        terminals_model: terminals_model.clone(),
+        handles: handles.clone(),
+        bufs: bufs.clone(),
+        runtime: runtime.clone(),
+        last_term_size: last_term_size.clone(),
+        sftp_handles: sftp_handles.clone(),
+        sftp_last_cwd: sftp_last_cwd.clone(),
+        tab_statuses: tab_statuses.clone(),
+        local_snap: local_snap.clone(),
+        local_net_hist: local_net_hist.clone(),
+        sftp_follow_cd: sftp_follow_cd.clone(),
+    };
+    wire_session_callbacks(&window, &session_callback_ctx);
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
     // `changed active-tab-id`).
@@ -446,7 +376,7 @@ pub fn run() -> Result<()> {
         let store = store.clone();
         let tabs_model = tabs_model.clone();
         window.on_set_language(move |code| {
-            crate::i18n::set_language(&code.to_string());
+            crate::i18n::set_language(code.as_ref());
             {
                 let mut s = store.borrow_mut();
                 s.set_language(crate::i18n::current_code().to_string());
@@ -610,7 +540,7 @@ pub fn run() -> Result<()> {
     // --- In-app update check (#48) -----------------------------------------
     // "Download" on the banner opens the latest-release page in the browser.
     window.on_open_update_url(move || {
-        let url = "https://github.com/jeff141/meatshell/releases/latest";
+        let url = "https://github.com/jeff141/cloudshell/releases/latest";
         #[cfg(windows)]
         let _ = std::process::Command::new("explorer").arg(url).spawn();
         #[cfg(target_os = "macos")]
@@ -624,16 +554,15 @@ pub fn run() -> Result<()> {
     {
         let weak = window.as_weak();
         std::thread::spawn(move || {
-            let body = match ureq::get(
-                "https://api.github.com/repos/jeff141/meatshell/releases/latest",
-            )
-            .set("User-Agent", "meatshell-update-check")
-            .timeout(std::time::Duration::from_secs(8))
-            .call()
-            {
-                Ok(resp) => resp.into_string().unwrap_or_default(),
-                Err(_) => return,
-            };
+            let body =
+                match ureq::get("https://api.github.com/repos/jeff141/cloudshell/releases/latest")
+                    .set("User-Agent", "cloudshell-update-check")
+                    .timeout(std::time::Duration::from_secs(8))
+                    .call()
+                {
+                    Ok(resp) => resp.into_string().unwrap_or_default(),
+                    Err(_) => return,
+                };
             let json: serde_json::Value = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(_) => return,
@@ -678,23 +607,53 @@ pub fn run() -> Result<()> {
     {
         let libs: Vec<SharedString> = [
             t("Slint — 图形界面框架 (GUI)", "Slint — GUI framework"),
-            t("russh / russh-keys — SSH 协议实现", "russh / russh-keys — SSH protocol"),
-            t("russh-sftp — SFTP 文件传输", "russh-sftp — SFTP file transfer"),
+            t(
+                "russh / russh-keys — SSH 协议实现",
+                "russh / russh-keys — SSH protocol",
+            ),
+            t(
+                "russh-sftp — SFTP 文件传输",
+                "russh-sftp — SFTP file transfer",
+            ),
             t("ssh-key — SSH 密钥解析", "ssh-key — SSH key parsing"),
             t("tokio — 异步运行时", "tokio — async runtime"),
-            t("vt100 — 终端 (VT100/xterm) 解析", "vt100 — terminal (VT100/xterm) parser"),
-            t("sysinfo — 本机资源采集", "sysinfo — local resource sampling"),
-            t("serde / serde_json — 配置序列化", "serde / serde_json — config serialization"),
+            t(
+                "vt100 — 终端 (VT100/xterm) 解析",
+                "vt100 — terminal (VT100/xterm) parser",
+            ),
+            t(
+                "sysinfo — 本机资源采集",
+                "sysinfo — local resource sampling",
+            ),
+            t(
+                "serde / serde_json — 配置序列化",
+                "serde / serde_json — config serialization",
+            ),
             t("arboard — 系统剪贴板", "arboard — system clipboard"),
             t("rfd — 原生文件对话框", "rfd — native file dialogs"),
-            t("directories — 配置目录定位", "directories — config dir lookup"),
+            t(
+                "directories — 配置目录定位",
+                "directories — config dir lookup",
+            ),
             t("chrono — 日期时间处理", "chrono — date/time handling"),
             t("uuid — 唯一标识符", "uuid — unique identifiers"),
-            t("anyhow / thiserror — 错误处理", "anyhow / thiserror — error handling"),
-            t("tracing / tracing-subscriber — 日志", "tracing / tracing-subscriber — logging"),
-            t("futures / async-trait — 异步辅助", "futures / async-trait — async helpers"),
+            t(
+                "anyhow / thiserror — 错误处理",
+                "anyhow / thiserror — error handling",
+            ),
+            t(
+                "tracing / tracing-subscriber — 日志",
+                "tracing / tracing-subscriber — logging",
+            ),
+            t(
+                "futures / async-trait — 异步辅助",
+                "futures / async-trait — async helpers",
+            ),
             t("rand — 随机数", "rand — randomness"),
-            t("winresource — Windows 图标/资源嵌入", "winresource — Windows icon/resource embedding"),
+            t(
+                "winresource — Windows 图标/资源嵌入",
+                "winresource — Windows icon/resource embedding",
+            ),
         ]
         .iter()
         .map(|s| (*s).into())
@@ -751,10 +710,7 @@ pub fn run() -> Result<()> {
             };
             // Append the raw local throughput to the bottom-graph ring buffer
             // (normalisation happens at display time so the graph auto-scales).
-            push_ring(
-                &mut tick_net.lock().unwrap(),
-                snap.net_bytes_per_sec as f32,
-            );
+            push_ring(&mut tick_net.lock().unwrap(), snap.net_bytes_per_sec as f32);
             // Stash the local sample; the sidebar shows it on the welcome tab
             // and in the bottom network graph.
             *tick_local.lock().unwrap() = snap.clone();
@@ -797,18 +753,17 @@ pub fn run() -> Result<()> {
                         win.set_window_maximized(maxed);
                     }
                 }
-                WEvent::CloseRequested => {
+                WEvent::CloseRequested
                     // Confirm before closing if there are open session tabs (#88),
                     // so a stray double-click on the title-bar icon / X / Alt+F4
                     // doesn't silently drop live sessions. The confirm dialog's
                     // "Close" calls quit_event_loop to actually exit.
-                    if !close_handles.borrow().is_empty() {
+                    if !close_handles.borrow().is_empty() => {
                         if let Some(win) = weak.upgrade() {
                             win.set_confirm_close_open(true);
                         }
                         return EventResult::PreventDefault;
                     }
-                }
                 _ => {}
             }
             EventResult::Propagate
@@ -916,12 +871,18 @@ fn center_window(win: &AppWindow) {
     }
     #[link(name = "user32")]
     extern "system" {
-        fn SystemParametersInfoW(action: u32, uiparam: u32, pvparam: *mut Rect, winini: u32) -> i32;
+        fn SystemParametersInfoW(action: u32, uiparam: u32, pvparam: *mut Rect, winini: u32)
+            -> i32;
     }
     const SPI_GETWORKAREA: u32 = 0x0030;
 
     let size = win.window().size(); // physical pixels
-    let mut wa = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut wa = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa, 0) };
     if ok == 0 {
         return;
@@ -982,10 +943,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     let w = win.window();
     let scale = w.scale_factor().max(0.01);
     let size = w.size(); // physical
-    let Some(inner) = w
-        .with_winit_window(|ww| ww.inner_position().ok())
-        .flatten()
-    else {
+    let Some(inner) = w.with_winit_window(|ww| ww.inner_position().ok()).flatten() else {
         return;
     };
     let Some((cx, cy)) = cursor_pos() else {
@@ -1003,10 +961,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     let zone_left = 381.0_f32;
     let zone_top = h_logical - h_sftp + 51.0;
     let zone_bottom = h_logical - 18.0;
-    if client_x < zone_left
-        || client_x > w_logical
-        || client_y < zone_top
-        || client_y > zone_bottom
+    if client_x < zone_left || client_x > w_logical || client_y < zone_top || client_y > zone_bottom
     {
         return; // dropped outside the file list — ignore
     }
@@ -1019,7 +974,11 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
     // every other online session — each into *its own* current SFTP dir. This
     // matches the upload button's behaviour (drag-and-drop is a separate path).
     let sync = win.get_sync_input() && win.get_sync_upload_enabled();
-    let other_dirs = if sync { terminal_sftp_paths(win) } else { HashMap::new() };
+    let other_dirs = if sync {
+        terminal_sftp_paths(win)
+    } else {
+        HashMap::new()
+    };
     if let Ok(handles) = sftp_handles.lock() {
         if let Some(h) = handles.get(&active) {
             h.upload(path.clone(), dir);
@@ -1133,8 +1092,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
 // Session callbacks (welcome page + dialog)
 // ---------------------------------------------------------------------------
 
-fn wire_session_callbacks(
-    window: &AppWindow,
+struct SessionCallbackCtx {
     store: Rc<RefCell<ConfigStore>>,
     sessions_model: Rc<VecModel<SessionInfo>>,
     tabs_model: Rc<VecModel<TabInfo>>,
@@ -1149,7 +1107,23 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
-) {
+}
+
+fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
+    let store = ctx.store.clone();
+    let sessions_model = ctx.sessions_model.clone();
+    let tabs_model = ctx.tabs_model.clone();
+    let terminals_model = ctx.terminals_model.clone();
+    let handles = ctx.handles.clone();
+    let bufs = ctx.bufs.clone();
+    let runtime = ctx.runtime.clone();
+    let last_term_size = ctx.last_term_size.clone();
+    let sftp_handles = ctx.sftp_handles.clone();
+    let sftp_last_cwd = ctx.sftp_last_cwd.clone();
+    let tab_statuses = ctx.tab_statuses.clone();
+    let local_snap = ctx.local_snap.clone();
+    let local_net_hist = ctx.local_net_hist.clone();
+    let sftp_follow_cd = ctx.sftp_follow_cd.clone();
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
     // Session.forwards; opening the dialog (new/edit) resets it.
@@ -1199,7 +1173,9 @@ fn wire_session_callbacks(
             let mut added = 0usize;
             if hosts.is_empty() {
                 if let Some(w) = weak.upgrade() {
-                    w.set_ssh_import_hint(t("未找到 ~/.ssh/config", "no ~/.ssh/config found").into());
+                    w.set_ssh_import_hint(
+                        t("未找到 ~/.ssh/config", "no ~/.ssh/config found").into(),
+                    );
                 }
                 return;
             }
@@ -1208,9 +1184,10 @@ fn wire_session_callbacks(
                 for h in hosts {
                     // Skip if a session already has this alias, or the same
                     // host + user pair.
-                    let dup = s.sessions().iter().any(|x| {
-                        x.name == h.alias || (x.host == h.hostname && x.user == h.user)
-                    });
+                    let dup = s
+                        .sessions()
+                        .iter()
+                        .any(|x| x.name == h.alias || (x.host == h.hostname && x.user == h.user));
                     if dup {
                         continue;
                     }
@@ -1223,7 +1200,11 @@ fn wire_session_callbacks(
                         name: h.alias,
                         host: h.hostname,
                         port: h.port,
-                        user: if h.user.is_empty() { "root".into() } else { h.user },
+                        user: if h.user.is_empty() {
+                            "root".into()
+                        } else {
+                            h.user
+                        },
                         auth,
                         private_key_path: h.identity_file,
                         ..Session::new_empty()
@@ -1253,7 +1234,7 @@ fn wire_session_callbacks(
         let store = store.clone();
         window.on_export_sessions(move || {
             if let Some(path) = rfd::FileDialog::new()
-                .set_file_name("meatshell-connections.json")
+                .set_file_name("cloudshell-connections.json")
                 .add_filter("JSON", &["json"])
                 .save_file()
             {
@@ -1308,7 +1289,9 @@ fn wire_session_callbacks(
         window.on_edit_session(move |id: SharedString| {
             let id = id.to_string();
             let store = store.borrow();
-            let Some(session) = store.get(&id) else { return; };
+            let Some(session) = store.get(&id) else {
+                return;
+            };
             *ef_edit.borrow_mut() = session.forwards.clone();
             if let Some(w) = weak.upgrade() {
                 w.set_dialog_forwards(forward_model(&session.forwards));
@@ -1347,7 +1330,7 @@ fn wire_session_callbacks(
         window.on_remove_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove(&id.to_string());
+                s.remove(id.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -1368,7 +1351,7 @@ fn wire_session_callbacks(
         window.on_duplicate_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut copy = orig;
                     copy.id = uuid::Uuid::new_v4().to_string();
                     copy.name = format!("{} (copy)", copy.name);
@@ -1394,7 +1377,7 @@ fn wire_session_callbacks(
         window.on_move_session(move |id: SharedString, group: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut moved = orig;
                     // "default" is the display label for ungrouped → store empty.
                     moved.group = if group.as_str() == "default" {
@@ -1460,7 +1443,7 @@ fn wire_session_callbacks(
                 if orig.is_empty() {
                     s.add_group(name.to_string());
                 } else {
-                    s.rename_group(&orig.to_string(), name.to_string());
+                    s.rename_group(orig.as_ref(), name.to_string());
                 }
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
@@ -1480,7 +1463,7 @@ fn wire_session_callbacks(
         window.on_delete_group(move |name: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove_group(&name.to_string());
+                s.remove_group(name.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -1512,7 +1495,7 @@ fn wire_session_callbacks(
             } else {
                 Secret::new(draft.password.to_string())
             };
-            let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
+            let kind = crate::config::SessionKind::from_str(draft.kind.as_ref());
             // Auto-name: serial → port label; otherwise user@host, or just the
             // host when no username was given (#110).
             let auto_name = match kind {
@@ -1542,7 +1525,7 @@ fn wire_session_callbacks(
                     draft.port as u16
                 },
                 user: draft.user.to_string(),
-                auth: AuthMethod::from_str(&draft.auth.to_string()),
+                auth: AuthMethod::from_str(draft.auth.as_ref()),
                 password,
                 // Store the key path with forward slashes uniformly.
                 private_key_path: draft.private_key_path.to_string().replace('\\', "/"),
@@ -1591,7 +1574,8 @@ fn wire_session_callbacks(
     {
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
-            let mut dialog = rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
+            let mut dialog =
+                rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -1727,18 +1711,20 @@ fn wire_session_callbacks(
                 find_matches: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 selection: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 sftp_path: "/".into(),
-                sftp_entries: ModelRc::from(
-                    std::rc::Rc::new(VecModel::<SftpEntry>::default()),
-                ),
+                sftp_entries: ModelRc::from(std::rc::Rc::new(VecModel::<SftpEntry>::default())),
                 sftp_status: if has_sftp {
                     t("SFTP 连接中...", "SFTP connecting...").into()
                 } else {
-                    t("此会话类型不支持 SFTP", "SFTP not available for this session").into()
+                    t(
+                        "此会话类型不支持 SFTP",
+                        "SFTP not available for this session",
+                    )
+                    .into()
                 },
                 sftp_loading: has_sftp,
-                sftp_tree_nodes: ModelRc::from(
-                    std::rc::Rc::new(VecModel::<SftpTreeNode>::default()),
-                ),
+                sftp_tree_nodes: ModelRc::from(std::rc::Rc::new(
+                    VecModel::<SftpTreeNode>::default(),
+                )),
                 sftp_selected_count: 0,
             });
             // Create vt100 parser for this tab (default 24×80; resized on first
@@ -1875,8 +1861,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             // (every prompt re-emits OSC 7) are ignored (#59).
                             let changed = match sftp_last_cwd_pump.lock() {
                                 Ok(mut m) => {
-                                    m.insert(tab_id_pump.clone(), cwd.clone())
-                                        .as_deref()
+                                    m.insert(tab_id_pump.clone(), cwd.clone()).as_deref()
                                         != Some(cwd.as_str())
                                 }
                                 Err(_) => false,
@@ -1885,8 +1870,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             // forwarding it would set sftp_loading without any
                             // ListDir to clear it (the #59 stuck-"loading" trap).
                             if !changed
-                                || !follow_cd_pump
-                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                || !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed)
                             {
                                 continue;
                             }
@@ -1983,285 +1967,15 @@ fn push_ring(buf: &mut Vec<f32>, val: f32) {
     buf.push(val);
 }
 
-/// Auto-scale a raw bytes/sec history to 0..1 against its own window peak so the
-/// sparkline always uses the full height (like FinalShell's relative graph).
-fn normalized_model(buf: &[f32]) -> ModelRc<f32> {
-    let max = buf.iter().cloned().fold(1.0_f32, f32::max);
-    let scaled: Vec<f32> = buf.iter().map(|v| (v / max).clamp(0.0, 1.0)).collect();
-    ModelRc::from(Rc::new(VecModel::from(scaled)))
-}
-
-/// Build the filesystem-usage model (path, "avail/total", used fraction).
-fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
-    let rows: Vec<DiskInfo> = disks
-        .iter()
-        .map(|(mount, avail, total)| {
-            let used = total.saturating_sub(*avail);
-            let percent = if *total > 0 {
-                used as f32 / *total as f32
-            } else {
-                0.0
-            };
-            DiskInfo {
-                path: mount.clone().into(),
-                detail: format!("{}/{}", format_size(*avail), format_size(*total)).into(),
-                percent,
-            }
-        })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Build the process-monitor model for the popup (#23). `cpu`/`mem` are
-/// pre-formatted to one decimal; `cpu_frac` (0..1) drives the row's load bar.
-fn proc_model(procs: &[ProcInfo]) -> ModelRc<ProcRow> {
-    let rows: Vec<ProcRow> = procs
-        .iter()
-        .map(|p| ProcRow {
-            pid: p.pid.to_string().into(),
-            user: p.user.clone().into(),
-            cpu: format!("{:.1}", p.cpu).into(),
-            mem: format!("{:.1}", p.mem).into(),
-            command: p.command.clone().into(),
-            cpu_frac: (p.cpu / 100.0).clamp(0.0, 1.0),
-        })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Every quick-command group name (used to start with all groups collapsed, #55):
-/// "default" when any ungrouped command exists, plus explicit quick-groups and any
-/// group referenced by a command.
-fn all_quick_group_names(store: &ConfigStore) -> std::collections::HashSet<String> {
-    let cmds = store.quick_commands();
-    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if cmds.iter().any(|c| c.group.trim().is_empty()) {
-        set.insert("default".to_string());
-    }
-    for g in store.quick_groups() {
-        set.insert(g.clone());
-    }
-    for c in cmds {
-        let g = c.group.trim();
-        if !g.is_empty() {
-            set.insert(g.to_string());
-        }
-    }
-    set
-}
-
-/// Build the quick-command model for the command bar + manage dialog (#55).
-///
-/// Grouped like the welcome session list: the implicit "default" group (entries
-/// with an empty group) comes first, then named groups alphabetically. Within a
-/// group, entries keep their saved order. `group_header` is set on the first row
-/// of each group; `collapsed` reflects `collapsed_groups` (runtime-only state);
-/// `orig_index` points back into the stored vec so deletes target the right entry
-/// even though the display order differs.
-fn quick_cmd_model(
-    store: &ConfigStore,
-    collapsed_groups: &std::collections::HashSet<String>,
-) -> ModelRc<QuickCmd> {
-    let cmds = store.quick_commands();
-
-    let has_default = cmds.iter().any(|c| c.group.trim().is_empty());
-    // Named groups = explicit quick-groups ∪ groups referenced by commands.
-    let mut named: Vec<String> = store
-        .quick_groups()
-        .iter()
-        .cloned()
-        .chain(
-            cmds.iter()
-                .map(|c| c.group.trim().to_string())
-                .filter(|g| !g.is_empty()),
-        )
-        .collect();
-    named.sort_by_key(|g| g.to_lowercase());
-    named.dedup();
-
-    let mut groups: Vec<String> = Vec::new();
-    if has_default {
-        groups.push("default".to_string());
-    }
-    groups.extend(named);
-
-    let mut rows: Vec<QuickCmd> = Vec::new();
-    for group in &groups {
-        let is_collapsed = collapsed_groups.contains(group);
-        let members: Vec<(usize, &crate::config::QuickCommand)> = cmds
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                let g = c.group.trim();
-                if group == "default" {
-                    g.is_empty()
-                } else {
-                    g == group
-                }
-            })
-            .collect();
-        if members.is_empty() {
-            // Header-only placeholder for an empty group (orig_index -1) so it can
-            // still be renamed / deleted, matching empty session folders.
-            rows.push(QuickCmd {
-                name: "".into(),
-                command: "".into(),
-                group: group.clone().into(),
-                group_header: group.clone().into(),
-                collapsed: is_collapsed,
-                orig_index: -1,
-            });
-        } else {
-            for (i, (orig_idx, c)) in members.iter().enumerate() {
-                rows.push(QuickCmd {
-                    name: c.name.clone().into(),
-                    command: c.command.clone().into(),
-                    group: group.clone().into(),
-                    group_header: if i == 0 { group.clone().into() } else { "".into() },
-                    collapsed: is_collapsed,
-                    orig_index: *orig_idx as i32,
-                });
-            }
-        }
-    }
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Build the port-forward list model for the session dialog (#56). Each row is
-/// a one-line human summary (`-L 127.0.0.1:8080 → host:80`).
-fn forward_model(forwards: &[crate::config::PortForward]) -> ModelRc<PortFwd> {
-    let rows: Vec<PortFwd> = forwards
-        .iter()
-        .map(|f| {
-            let bind = if f.bind_addr.trim().is_empty() {
-                "127.0.0.1"
-            } else {
-                f.bind_addr.trim()
-            };
-            let summary = match f.kind.as_str() {
-                "local" => format!("-L {}:{} → {}:{}", bind, f.bind_port, f.host, f.host_port),
-                "remote" => format!("-R {}:{} → {}:{}", bind, f.bind_port, f.host, f.host_port),
-                "dynamic" => format!("-D {}:{} (SOCKS5)", bind, f.bind_port),
-                _ => String::new(),
-            };
-            PortFwd {
-                kind: f.kind.clone().into(),
-                name: f.name.clone().into(),
-                summary: summary.into(),
-            }
-        })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Collect the full paths of the checked SFTP entries for a tab (#100).
-fn collect_sftp_selected(terminals: &VecModel<TerminalState>, tab_id: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for ti in 0..terminals.row_count() {
-        let Some(row) = terminals.row_data(ti) else { continue };
-        if row.id.as_str() != tab_id {
-            continue;
-        }
-        if let Some(em) = row.sftp_entries.as_any().downcast_ref::<VecModel<SftpEntry>>() {
-            for ei in 0..em.row_count() {
-                if let Some(e) = em.row_data(ei) {
-                    if e.selected {
-                        paths.push(e.full_path.to_string());
-                    }
-                }
-            }
-        }
-        break;
-    }
-    paths
-}
-
-/// Uncheck every SFTP entry for a tab and reset its selected-count (#100).
-fn clear_sftp_selection(terminals: &VecModel<TerminalState>, tab_id: &str) {
-    for ti in 0..terminals.row_count() {
-        let Some(row) = terminals.row_data(ti) else { continue };
-        if row.id.as_str() != tab_id {
-            continue;
-        }
-        if let Some(em) = row.sftp_entries.as_any().downcast_ref::<VecModel<SftpEntry>>() {
-            for ei in 0..em.row_count() {
-                if let Some(mut e) = em.row_data(ei) {
-                    if e.selected {
-                        e.selected = false;
-                        em.set_row_data(ei, e);
-                    }
-                }
-            }
-        }
-        let mut r = row.clone();
-        r.sftp_selected_count = 0;
-        terminals.set_row_data(ti, r);
-        break;
-    }
-}
-
-/// Build the command-history model in storage order (oldest first, newest
-/// last). The dropdown shows the most-recently-used command at the bottom
-/// (nearest the input) and ↑ recalls it first (#55, #113).
-fn history_model(store: &ConfigStore) -> ModelRc<SharedString> {
-    let rows: Vec<SharedString> = store
-        .command_history()
-        .iter()
-        .map(|s| s.clone().into())
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Build the filtered history-view model for the dropdown: case-insensitive
-/// substring matches of `query`, in the same order as the full history (#101).
-fn history_view_model(store: &ConfigStore, query: &str) -> ModelRc<SharedString> {
-    let q = query.trim().to_lowercase();
-    let rows: Vec<SharedString> = store
-        .command_history()
-        .iter()
-        .filter(|c| q.is_empty() || c.to_lowercase().contains(&q))
-        .map(|s| s.clone().into())
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Find every (case-insensitive) occurrence of `query` across the currently
-/// displayed rows and return highlight rectangles (char index == grid column).
-fn compute_find_matches(rows: &[String], query: &str) -> Vec<TermMatch> {
-    let mut out: Vec<TermMatch> = Vec::new();
-    if query.is_empty() {
-        return out;
-    }
-    let q: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
-    if q.is_empty() {
-        return out;
-    }
-    for (r, line) in rows.iter().enumerate() {
-        let lower: Vec<char> = line.chars().map(|c| c.to_ascii_lowercase()).collect();
-        let mut i = 0usize;
-        while i + q.len() <= lower.len() {
-            if lower[i..i + q.len()] == q[..] {
-                out.push(TermMatch {
-                    row: r as i32,
-                    col: i as i32,
-                    len: q.len() as i32,
-                });
-                i += q.len();
-            } else {
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
 /// Recompute spans + cursor + find/selection highlights for one tab from its
 /// current vt100 screen (respecting scrollback) and push them to the model.
 /// Used by scroll + selection callbacks (Output has its own equivalent inline).
 fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
     let data = {
         let mut map = bufs.lock().unwrap();
-        let Some(buf) = map.get_mut(tab_id) else { return };
+        let Some(buf) = map.get_mut(tab_id) else {
+            return;
+        };
         let cols = buf.parser.screen().size().1;
         let b = buf.render(); // also refreshes buf.displayed_text
         let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
@@ -2370,9 +2084,7 @@ fn refresh_sidebar(
             win.set_cpu_percent(st.cpu);
             win.set_mem_percent(pct(st.mem_used_kib, st.mem_total_kib));
             win.set_swap_percent(pct(st.swap_used_kib, st.swap_total_kib));
-            win.set_mem_detail(
-                format_mem(st.mem_used_kib / 1024, st.mem_total_kib / 1024).into(),
-            );
+            win.set_mem_detail(format_mem(st.mem_used_kib / 1024, st.mem_total_kib / 1024).into());
             win.set_swap_detail(
                 format_mem(st.swap_used_kib / 1024, st.swap_total_kib / 1024).into(),
             );
@@ -2382,8 +2094,7 @@ fn refresh_sidebar(
             win.set_net_top_history(normalized_model(&st.net_hist));
             win.set_net_show_selector(!st.net.is_empty());
             win.set_net_selected(name.into());
-            let ifaces: Vec<SharedString> =
-                st.net.iter().map(|e| e.0.clone().into()).collect();
+            let ifaces: Vec<SharedString> = st.net.iter().map(|e| e.0.clone().into()).collect();
             win.set_net_ifaces(ModelRc::from(Rc::new(VecModel::from(ifaces))));
             win.set_disks(disk_model(&st.disks));
             win.set_proc_available(true);
@@ -2538,7 +2249,9 @@ fn apply_session_event_to_window(
                 local_net_hist,
             );
             update_tab(&|t| t.connected = false);
-            update_terminal(&|t| t.status = format!("{} — {reason}", crate::i18n::t("已断开", "Disconnected")).into());
+            update_terminal(&|t| {
+                t.status = format!("{} — {reason}", crate::i18n::t("已断开", "Disconnected")).into()
+            });
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 2;
             }
@@ -2604,9 +2317,7 @@ fn apply_session_event_to_window(
                     selected: false,
                 })
                 .collect();
-            let model = ModelRc::from(
-                std::rc::Rc::new(VecModel::from(slint_entries)),
-            );
+            let model = ModelRc::from(std::rc::Rc::new(VecModel::from(slint_entries)));
             update_terminal(&|t| {
                 t.sftp_path = path.clone().into();
                 t.sftp_entries = model.clone();
@@ -2648,7 +2359,7 @@ fn apply_session_event_to_window(
                     win,
                     tab_id,
                     SessionEvent::Output(format!(
-                        "\r\n[meatshell] {} {}: {}\r\n",
+                        "\r\n[cloudshell] {} {}: {}\r\n",
                         crate::i18n::t("无法打开", "Cannot open"),
                         name,
                         error
@@ -2686,7 +2397,13 @@ fn apply_session_event_to_window(
         } => {
             let detail = match state {
                 // On error, show the actual message when we have one.
-                2 => if msg.is_empty() { t("失败", "Failed").to_string() } else { msg },
+                2 => {
+                    if msg.is_empty() {
+                        t("失败", "Failed").to_string()
+                    } else {
+                        msg
+                    }
+                }
                 1 => t("已完成", "Done").to_string(),
                 // Remote-side prep (e.g. tar packing) before bytes start flowing (#100).
                 3 => t("文件准备中", "Preparing...").to_string(),
@@ -2753,7 +2470,15 @@ fn apply_session_event_to_window(
             need_password,
             responder,
         } => {
-            enqueue_cred_prompt(win, session_id, host, user, need_user, need_password, responder);
+            enqueue_cred_prompt(
+                win,
+                session_id,
+                host,
+                user,
+                need_user,
+                need_password,
+                responder,
+            );
         }
         SessionEvent::CommandRan(cmd) => {
             // A command typed directly in the terminal, captured via the shell
@@ -2801,7 +2526,7 @@ struct PendingHostKey {
 thread_local! {
     /// Prompts awaiting a decision; the front one is shown. Lives on the Slint
     /// event-loop thread (all access is from there).
-    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = RefCell::new(VecDeque::new());
+    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = const { RefCell::new(VecDeque::new()) };
     /// host:port → decision, remembered for this run so a duplicate prompt
     /// (second connection to the same host) is answered without a new dialog.
     static HOSTKEY_DECIDED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
@@ -2905,7 +2630,8 @@ fn resolve_front_hostkey(win: &AppWindow, accept: bool) {
         let mut q = q.borrow_mut();
         if let Some(p) = q.pop_front() {
             HOSTKEY_DECIDED.with(|d| {
-                d.borrow_mut().insert(format!("{}:{}", p.host, p.port), accept);
+                d.borrow_mut()
+                    .insert(format!("{}:{}", p.host, p.port), accept);
             });
             for r in &p.responders {
                 r.respond(accept);
@@ -2937,7 +2663,7 @@ struct PendingCred {
 }
 
 thread_local! {
-    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = RefCell::new(VecDeque::new());
+    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = const { RefCell::new(VecDeque::new()) };
     /// session id → the answer given this run (`None` = cancelled), so a second
     /// connection for the same session is answered without re-prompting.
     static CRED_DECIDED: RefCell<HashMap<String, Option<crate::ssh::CredentialReply>>> =
@@ -3154,11 +2880,7 @@ fn wire_tab_callbacks(
 // SFTP callbacks
 // ---------------------------------------------------------------------------
 
-fn wire_sftp_callbacks(
-    window: &AppWindow,
-    sftp_handles: SftpHandles,
-    sftp_last_cwd: SftpLastCwd,
-) {
+fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_cwd: SftpLastCwd) {
     // Navigate to a remote path (or ".." to go up one level).
     {
         let sftp_handles = sftp_handles.clone();
@@ -3420,7 +3142,11 @@ fn wire_sftp_callbacks(
                 if row.id.as_str() != tab_id.as_str() {
                     continue;
                 }
-                if let Some(em) = row.sftp_entries.as_any().downcast_ref::<VecModel<SftpEntry>>() {
+                if let Some(em) = row
+                    .sftp_entries
+                    .as_any()
+                    .downcast_ref::<VecModel<SftpEntry>>()
+                {
                     let i = idx as usize;
                     if let Some(mut e) = em.row_data(i) {
                         e.selected = !e.selected;
@@ -3494,7 +3220,11 @@ fn wire_sftp_callbacks(
                                 if single {
                                     h.download(paths[0].clone(), dir.clone());
                                 } else {
-                                    h.download_archive(remote_dir.clone(), names.clone(), dir.clone());
+                                    h.download_archive(
+                                        remote_dir.clone(),
+                                        names.clone(),
+                                        dir.clone(),
+                                    );
                                 }
                             }
                         }
@@ -3600,11 +3330,8 @@ fn wire_sftp_callbacks(
                 };
                 match kind.as_str() {
                     "rename" => {
-                        let to = format!(
-                            "{}/{}",
-                            parent_path(&target).trim_end_matches('/'),
-                            value
-                        );
+                        let to =
+                            format!("{}/{}", parent_path(&target).trim_end_matches('/'), value);
                         h.rename(target, to);
                     }
                     "mkdir" => {
@@ -3743,32 +3470,34 @@ fn wire_key_input(
         let handles_rc = handles.clone();
         let store_rc = store.clone();
         let weak = window.as_weak();
-        window.on_run_command(move |tab_id: SharedString, cmd: SharedString, to_all: bool| {
-            let line = cmd.trim_end().to_string();
-            if line.is_empty() {
-                return;
-            }
-            let mut bytes = line.clone().into_bytes();
-            bytes.push(b'\n');
-            {
-                let h = handles_rc.borrow();
-                if to_all {
-                    for handle in h.values() {
-                        handle.send_raw(bytes.clone());
-                    }
-                } else if let Some(handle) = h.get(tab_id.as_str()) {
-                    handle.send_raw(bytes);
+        window.on_run_command(
+            move |tab_id: SharedString, cmd: SharedString, to_all: bool| {
+                let line = cmd.trim_end().to_string();
+                if line.is_empty() {
+                    return;
                 }
-            }
-            {
-                let mut s = store_rc.borrow_mut();
-                s.push_command_history(line);
-                let _ = s.save();
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_command_history(history_model(&store_rc.borrow()));
-            }
-        });
+                let mut bytes = line.clone().into_bytes();
+                bytes.push(b'\n');
+                {
+                    let h = handles_rc.borrow();
+                    if to_all {
+                        for handle in h.values() {
+                            handle.send_raw(bytes.clone());
+                        }
+                    } else if let Some(handle) = h.get(tab_id.as_str()) {
+                        handle.send_raw(bytes);
+                    }
+                }
+                {
+                    let mut s = store_rc.borrow_mut();
+                    s.push_command_history(line);
+                    let _ = s.save();
+                }
+                if let Some(w) = weak.upgrade() {
+                    w.set_command_history(history_model(&store_rc.borrow()));
+                }
+            },
+        );
     }
     // Copy a history command to the clipboard (#96).
     {
@@ -3981,7 +3710,11 @@ fn wire_key_input(
         let collapsed = collapsed_quick_groups.clone();
         window.on_move_quick_command(move |index: i32, group: SharedString| {
             let target = group.to_string();
-            let target = if target == "default" { String::new() } else { target };
+            let target = if target == "default" {
+                String::new()
+            } else {
+                target
+            };
             {
                 let mut s = store_rc.borrow_mut();
                 let mut v = s.quick_commands().to_vec();
@@ -4007,7 +3740,7 @@ fn wire_key_input(
                 if orig.is_empty() {
                     s.add_quick_group(name.to_string());
                 } else {
-                    s.rename_quick_group(&orig.to_string(), name.to_string());
+                    s.rename_quick_group(orig.as_ref(), name.to_string());
                 }
                 let _ = s.save();
             }
@@ -4024,7 +3757,7 @@ fn wire_key_input(
         window.on_delete_quick_group(move |name: SharedString| {
             {
                 let mut s = store_rc.borrow_mut();
-                s.remove_quick_group(&name.to_string());
+                s.remove_quick_group(name.as_ref());
                 let _ = s.save();
             }
             if let Some(w) = weak.upgrade() {
@@ -4052,8 +3785,7 @@ fn wire_key_input(
         let sync_input = sync_input.clone();
         // Shared timestamp: the last time the Shift key alone was pressed
         // (key="", shift=true).  Used by the time-based Backspace filter below.
-        let last_shift_time: Arc<Mutex<Option<std::time::Instant>>> =
-            Arc::new(Mutex::new(None));
+        let last_shift_time: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
         window.on_send_key(move |tab_id: SharedString, key: SharedString, ctrl: bool, alt: bool, shift: bool| {
             // ── Enter on a disconnected tab → reconnect in place (#79) ──────
             // FinalShell-style: the tab shows "连接已断开,按 Enter 重新连接";
@@ -4340,17 +4072,14 @@ fn wire_key_input(
     {
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
-        // The Slint side now measures the real Consolas cell size (via a hidden
-        // probe Text) and passes whole column/row counts directly, so there is
-        // no pixel→cell guesswork here.  This keeps full-screen programs like
-        // nano from over-counting rows and clipping their bottom shortcut bar.
+                                        // The Slint side now measures the real Consolas cell size (via a hidden
+                                        // probe Text) and passes whole column/row counts directly, so there is
+                                        // no pixel→cell guesswork here.  This keeps full-screen programs like
+                                        // nano from over-counting rows and clipping their bottom shortcut bar.
         window.on_terminal_resize(move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
             let cols = (cols_f as u32).max(10);
             let rows = (rows_f as u32).max(5);
-            tracing::debug!(
-                "terminal_resize tab={} cols={} rows={}",
-                tab_id, cols, rows
-            );
+            tracing::debug!("terminal_resize tab={} cols={} rows={}", tab_id, cols, rows);
             // Keep the shared size up-to-date so future connections start
             // with the correct PTY dimensions.
             *last_term_size.lock().unwrap() = (cols, rows);
@@ -4477,12 +4206,9 @@ fn wire_key_input(
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
-                    row.spans =
-                        ModelRc::from(Rc::new(VecModel::<TermSpan>::default()));
-                    row.find_matches =
-                        ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
-                    row.selection =
-                        ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
+                    row.spans = ModelRc::from(Rc::new(VecModel::<TermSpan>::default()));
+                    row.find_matches = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
+                    row.selection = ModelRc::from(Rc::new(VecModel::<TermMatch>::default()));
                     row.cursor_row = 0;
                     row.cursor_col = 0;
                     row.rows_used = 0;
@@ -4783,7 +4509,7 @@ fn clipboard_set_text(text: String) {
 /// Enumerate installed monospace font families for the Interface font picker.
 /// Terminals want fixed-width fonts, so non-monospace families are filtered out.
 /// Choose a UI font family that fontdb can actually resolve, falling back to the
-/// embedded "Meatshell Mono" when the system font database is empty/unreadable.
+/// embedded "Cloudshell Mono" when the system font database is empty/unreadable.
 ///
 /// macOS 26 (Tahoe) shipped a system where fontdb couldn't register the named
 /// CJK font ("PingFang SC"), so hard-coding that name made the whole UI render
@@ -4797,12 +4523,12 @@ fn resolve_ui_font_family() -> slint::SharedString {
     use fontdb::{Database, Family, Query, Stretch, Style, Weight};
 
     // Diagnostic / escape hatch (#129): force a specific UI font without a rebuild.
-    // e.g. MEATSHELL_UI_FONT="Meatshell Mono" to test whether the embedded font
+    // e.g. CLOUDSHELL_UI_FONT="Cloudshell Mono" to test whether the embedded font
     // renders when system fonts don't. Empty value is ignored.
-    if let Some(f) = std::env::var_os("MEATSHELL_UI_FONT") {
+    if let Some(f) = std::env::var_os("CLOUDSHELL_UI_FONT") {
         let f = f.to_string_lossy().into_owned();
         if !f.trim().is_empty() {
-            tracing::debug!(font = %f, "ui-font: overridden via MEATSHELL_UI_FONT");
+            tracing::debug!(font = %f, "ui-font: overridden via CLOUDSHELL_UI_FONT");
             return f.into();
         }
     }
@@ -4820,18 +4546,25 @@ fn resolve_ui_font_family() -> slint::SharedString {
     // ship on every macOS, so we prefer them and keep PingFang only as a late
     // fallback. (Verified on an M2/macOS 26: Heiti SC/STHeiti/Songti SC render,
     // PingFang/Hiragino don't.) Power users can still force one via
-    // MEATSHELL_UI_FONT. Heiti SC is a clean sans-serif (better for UI than the
+    // CLOUDSHELL_UI_FONT. Heiti SC is a clean sans-serif (better for UI than the
     // serif Songti), so it leads.
     #[cfg(target_os = "macos")]
     let candidates: &[&str] = &[
-        "Heiti SC", "STHeiti", "Songti SC", "PingFang SC", "Hiragino Sans GB",
+        "Heiti SC",
+        "STHeiti",
+        "Songti SC",
+        "PingFang SC",
+        "Hiragino Sans GB",
     ];
     #[cfg(target_os = "windows")]
     let candidates: &[&str] = &["Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "SimSun"];
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let candidates: &[&str] = &[
-        "Noto Sans CJK SC", "Noto Sans CJK", "Source Han Sans SC",
-        "WenQuanYi Micro Hei", "Droid Sans Fallback",
+        "Noto Sans CJK SC",
+        "Noto Sans CJK",
+        "Source Han Sans SC",
+        "WenQuanYi Micro Hei",
+        "Droid Sans Fallback",
     ];
 
     for name in candidates {
@@ -4842,7 +4575,11 @@ fn resolve_ui_font_family() -> slint::SharedString {
             style: Style::Normal,
         };
         if db.query(&q).is_some() {
-            tracing::debug!(faces = face_count, font = name, "ui-font: using system CJK font");
+            tracing::debug!(
+                faces = face_count,
+                font = name,
+                "ui-font: using system CJK font"
+            );
             return (*name).into();
         }
     }
@@ -4860,9 +4597,11 @@ fn resolve_ui_font_family() -> slint::SharedString {
         tracing::warn!(faces = face_count, available = ?sample,
             "ui-font: no preferred CJK font resolved; listing available families");
     }
-    tracing::warn!(faces = face_count,
-        "ui-font: falling back to embedded 'Meatshell Mono' (system fonts unusable, #129)");
-    "Meatshell Mono".into()
+    tracing::warn!(
+        faces = face_count,
+        "ui-font: falling back to embedded 'Cloudshell Mono' (system fonts unusable, #129)"
+    );
+    "Cloudshell Mono".into()
 }
 
 fn system_monospace_fonts() -> Vec<slint::SharedString> {
@@ -4878,8 +4617,8 @@ fn system_monospace_fonts() -> Vec<slint::SharedString> {
     // Surface the built-in glyph-complete font first so it's selectable and the
     // default selection is shown — it isn't a system face so fontdb won't list it
     // (#114).
-    names.retain(|n| n != "Meatshell Mono");
-    let mut out = vec![slint::SharedString::from("Meatshell Mono")];
+    names.retain(|n| n != "Cloudshell Mono");
+    let mut out = vec![slint::SharedString::from("Cloudshell Mono")];
     out.extend(names.into_iter().map(slint::SharedString::from));
     out
 }
@@ -4915,156 +4654,21 @@ fn split_proxy(url: &str) -> (String, String) {
     let lower = s.to_ascii_lowercase();
     for p in ["http://", "https://"] {
         if lower.starts_with(p) {
-            return ("http".to_string(), s[p.len()..].trim_end_matches('/').to_string());
+            return (
+                "http".to_string(),
+                s[p.len()..].trim_end_matches('/').to_string(),
+            );
         }
     }
     for p in ["socks5h://", "socks5://", "socks://"] {
         if lower.starts_with(p) {
-            return ("socks5".to_string(), s[p.len()..].trim_end_matches('/').to_string());
+            return (
+                "socks5".to_string(),
+                s[p.len()..].trim_end_matches('/').to_string(),
+            );
         }
     }
     ("socks5".to_string(), s.trim_end_matches('/').to_string())
-}
-
-/// Normalise pasted text's line endings to a single CR (0x0d) — what a terminal
-/// expects for Enter.
-///
-/// The clipboard may hold CRLF (Windows) or LF line breaks. Sending those to the
-/// PTY verbatim makes the remote shell see *two* line breaks per line (CR then
-/// LF), which prematurely ends a `\`-continued line: pasting
-/// `sudo apt install \<newline>  docker-ce` would run `sudo apt install` with no
-/// package and drop the rest. Collapsing every CRLF/LF to one CR fixes it.
-fn normalize_pasted_newlines(text: &str) -> String {
-    text.replace("\r\n", "\r").replace('\n', "\r")
-}
-
-fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u8> {
-    // --- Special keys (Slint PUA code points) ------------------------------
-    // Arrow keys: respect DECCKM application-cursor mode.
-    let special: Option<&[u8]> = match key {
-        "\u{F700}" => Some(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }), // Up
-        "\u{F701}" => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }), // Down
-        "\u{F702}" => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }), // Left
-        "\u{F703}" => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }), // Right
-        "\u{F729}" => Some(b"\x1b[H"),   // Home
-        "\u{F72B}" => Some(b"\x1b[F"),   // End
-        "\u{F72C}" => Some(b"\x1b[5~"),  // PageUp
-        "\u{F72D}" => Some(b"\x1b[6~"),  // PageDown
-        "\u{F728}" => Some(b"\x1b[3~"),  // Delete (forward)
-        "\u{F704}" => Some(b"\x1bOP"),   // F1
-        "\u{F705}" => Some(b"\x1bOQ"),   // F2
-        "\u{F706}" => Some(b"\x1bOR"),   // F3
-        "\u{F707}" => Some(b"\x1bOS"),   // F4
-        "\u{F708}" => Some(b"\x1b[15~"), // F5
-        "\u{F709}" => Some(b"\x1b[17~"), // F6
-        "\u{F70A}" => Some(b"\x1b[18~"), // F7
-        "\u{F70B}" => Some(b"\x1b[19~"), // F8
-        "\u{F70C}" => Some(b"\x1b[20~"), // F9
-        "\u{F70D}" => Some(b"\x1b[21~"), // F10
-        "\u{F70E}" => Some(b"\x1b[23~"), // F11
-        "\u{F70F}" => Some(b"\x1b[24~"), // F12
-        _ => None,
-    };
-    if let Some(seq) = special {
-        return seq.to_vec();
-    }
-
-    // Slint sometimes sends `\u{0008}` for Backspace; terminals expect DEL.
-    if key == "\u{0008}" {
-        return vec![0x7f];
-    }
-
-    // Slint encodes Key::Return as "\n" (U+000A, LF).  Every real terminal
-    // emulator (xterm, WezTerm, PuTTY …) sends 0x0D (CR) for Enter because
-    // that is what a physical keyboard generates over a serial line.  bash/
-    // readline happens to accept LF too, but ncurses apps in raw mode (nano,
-    // vim command-line, passwd prompts …) strictly require CR to confirm input.
-    // Ctrl+J (ctrl=true, "\n") intentionally stays 0x0A — it is a distinct
-    // control character in some applications.
-    if key == "\n" && !ctrl && !alt {
-        return vec![0x0d];
-    }
-
-    // Empty text (e.g. the Ctrl/Shift/Alt key press itself) — nothing to send.
-    if key.is_empty() {
-        return vec![];
-    }
-
-    // --- Bare modifier keys: never forward to the PTY (issue #43) -----------
-    // Slint encodes a lone modifier keypress not as "" but as a C0 code point:
-    //   Shift=0x10 Ctrl=0x11 Alt=0x12 AltGr=0x13 CapsLock=0x14
-    //   ShiftR=0x15 CtrlR=0x16 Meta=0x17 MetaR=0x18
-    // Pressing Alt by itself (e.g. to Alt+Tab away) arrives here as key=0x12
-    // with alt=true. Without this guard it would fall through to the Alt branch
-    // below, get an ESC (0x1b) prefix, and bash/readline would treat the ESC as
-    // Meta and discard the line the user was typing — the "Alt clears the
-    // command" bug.
-    //
-    // The `!ctrl` guard is deliberate: a real Ctrl+P..Ctrl+X is encoded by some
-    // Linux/macOS builds directly as the same C0 bytes (0x10..0x18) but with
-    // ctrl=true (handled by the Ctrl branch just below), so we must NOT swallow
-    // those. A lone modifier never carries ctrl=true except bare Ctrl/CtrlR
-    // themselves, which are harmless to pass through as today.
-    if !ctrl {
-        if let Some(c) = key.chars().next() {
-            let cp = c as u32;
-            if key.chars().count() == 1 && (0x10..=0x18).contains(&cp) {
-                return vec![];
-            }
-        }
-    }
-
-    // --- Ctrl + letter: synthesise C0 control character --------------------
-    // Two cases:
-    //   A) Platform already encoded the control char in `key` (e.g. "\x18" for
-    //      Ctrl+X on some Linux/macOS builds). Pass through directly.
-    //   B) Platform sends the letter ("x") with modifiers.control=true.
-    //      We synthesise the C0 code ourselves.
-    if ctrl {
-        // Case A: key is already a C0 control character (0x01..0x1F, not ESC).
-        if let Some(c) = key.chars().next() {
-            let cp = c as u32;
-            if key.chars().count() == 1 && (0x01..=0x1f).contains(&cp) {
-                return vec![cp as u8];
-            }
-        }
-        // Case B: letter + ctrl modifier.
-        if let Some(c) = key.chars().next() {
-            if key.chars().count() == 1 {
-                let upper = c.to_ascii_uppercase() as u8;
-                let ctrl_char: Option<u8> = match upper {
-                    b'A'..=b'Z' => Some(upper - b'A' + 1),      // Ctrl+A=\x01 … Ctrl+Z=\x1A
-                    b'[' => Some(0x1b),                           // Ctrl+[ = ESC
-                    b'\\' => Some(0x1c),
-                    b']' => Some(0x1d),
-                    b'^' => Some(0x1e),
-                    b'_' => Some(0x1f),
-                    b'@' => Some(0x00),
-                    _ => None,
-                };
-                if let Some(byte) = ctrl_char {
-                    return vec![byte];
-                }
-            }
-        }
-    }
-
-    // --- Skip unknown Private Use Area code points -------------------------
-    if key.chars().any(|c| (0xE000..=0xF8FF).contains(&(c as u32))) {
-        return vec![];
-    }
-
-    // --- Alt + key: prefix with ESC ----------------------------------------
-    if alt && !ctrl {
-        let mut bytes = vec![0x1b];
-        bytes.extend_from_slice(key.as_bytes());
-        return bytes;
-    }
-
-    // --- Everything else: send UTF-8 bytes as-is ---------------------------
-    // This covers printable characters, \r (Enter), \t (Tab), \x1b (Escape),
-    // and any C0 control chars the platform already encoded in `key`.
-    key.as_bytes().to_vec()
 }
 
 /// Windows-only: returns `true` when the physical Backspace key (VK_BACK) is
@@ -5139,9 +4743,6 @@ struct HistSpan {
     col: i32,
     cells: i32,
 }
-
-/// A rendered line: plain text (one char per cell, for find/selection) + runs.
-type Line = (String, Vec<HistSpan>);
 
 /// Per-session scrollback cap (recycled on clear / tab close).
 const MAX_HISTORY: usize = 100_000;
@@ -5452,7 +5053,11 @@ impl TermBuffer {
                     } else {
                         // Not a CSI (could be another ESC, OSC, etc.).  Re-arm on
                         // a fresh ESC, otherwise fall back to normal text.
-                        self.csi_state = if b == 0x1b { CsiState::Esc } else { CsiState::Normal };
+                        self.csi_state = if b == 0x1b {
+                            CsiState::Esc
+                        } else {
+                            CsiState::Normal
+                        };
                     }
                     out.push(b);
                 }
@@ -5479,9 +5084,9 @@ impl TermBuffer {
         // btop configured with `alt-screen = false`).
         // We look for \033[H (cursor-home) and \033[2J / \033[J (erase display)
         // as indicators that the program is doing a full-screen refresh.
-        let has_cursor_home   = bytes.windows(3).any(|w| w == b"\x1b[H");
-        let has_erase_display = bytes.windows(4).any(|w| w == b"\x1b[2J")
-                             || bytes.windows(3).any(|w| w == b"\x1b[J");
+        let has_cursor_home = bytes.windows(3).any(|w| w == b"\x1b[H");
+        let has_erase_display =
+            bytes.windows(4).any(|w| w == b"\x1b[2J") || bytes.windows(3).any(|w| w == b"\x1b[J");
         let is_fullscreen_refresh = has_cursor_home && has_erase_display;
 
         self.parser.process(bytes);
@@ -5558,7 +5163,11 @@ impl TermBuffer {
                 displayed.push(plain.trim_end().to_string());
             }
             self.displayed_text = displayed;
-            let rows_used = if is_alt { rows as i32 } else { last_content + 1 };
+            let rows_used = if is_alt {
+                rows as i32
+            } else {
+                last_content + 1
+            };
             return BuiltScreen {
                 spans,
                 cursor_row: cur_row as i32,
@@ -5642,7 +5251,7 @@ fn contains_cjk(s: &str) -> bool {
             | 0x4E00..=0x9FFF     // CJK unified ideographs
             | 0xF900..=0xFAFF     // CJK compatibility ideographs
             | 0xFF00..=0xFFEF     // fullwidth / halfwidth forms (，！？：；)
-            | 0x20000..=0x2FA1F)  // CJK ext B–F + compat supplement
+            | 0x20000..=0x2FA1F) // CJK ext B–F + compat supplement
     })
 }
 
@@ -5726,11 +5335,19 @@ const ANSI16_LIGHT_BG: [(u8, u8, u8); 16] = [
 fn vt_color_to_slint(color: vt100::Color, bold: bool, is_dark: bool) -> slint::Color {
     let (r, g, b) = match color {
         vt100::Color::Default => {
-            if is_dark { (0xd4, 0xd4, 0xd4) } else { (0x2d, 0x2d, 0x2f) }
+            if is_dark {
+                (0xd4, 0xd4, 0xd4)
+            } else {
+                (0x2d, 0x2d, 0x2f)
+            }
         }
         vt100::Color::Idx(i) => idx_to_rgb(i, bold, is_dark),
         vt100::Color::Rgb(r, g, b) => {
-            if is_dark { (r, g, b) } else { darken_light_fg(r, g, b) }
+            if is_dark {
+                (r, g, b)
+            } else {
+                darken_light_fg(r, g, b)
+            }
         }
     };
     slint::Color::from_rgb_u8(r, g, b)
@@ -5801,7 +5418,11 @@ fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
         return (0.0, 0.0, l);
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if (max - r).abs() < 1e-6 {
         (g - b) / d + if g < b { 6.0 } else { 0.0 }
     } else if (max - g).abs() < 1e-6 {
@@ -5817,14 +5438,28 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
         let v = (l * 255.0).round() as u8;
         return (v, v, v);
     }
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let hue = |mut t: f32| -> f32 {
-        if t < 0.0 { t += 1.0; }
-        if t > 1.0 { t -= 1.0; }
-        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
-        if t < 0.5 { return q; }
-        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            return p + (q - p) * 6.0 * t;
+        }
+        if t < 0.5 {
+            return q;
+        }
+        if t < 2.0 / 3.0 {
+            return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+        }
         p
     };
     (
@@ -5843,7 +5478,11 @@ fn idx_to_rgb(i: u8, bold: bool, is_dark: bool) -> (u8, u8, u8) {
         16..=231 => {
             let n = i - 16;
             let to = |v: u8| -> u8 {
-                if v == 0 { 0 } else { 55 + v * 40 }
+                if v == 0 {
+                    0
+                } else {
+                    55 + v * 40
+                }
             };
             (to(n / 36), to((n % 36) / 6), to(n % 6))
         }
@@ -5864,20 +5503,6 @@ fn idx_to_rgb_bg(i: u8, is_dark: bool) -> (u8, u8, u8) {
     idx_to_rgb(i, false, is_dark)
 }
 
-/// Return the parent directory of `path`.
-/// "/a/b/c" → "/a/b", "/a" → "/", "/" → "/"
-fn parent_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return "/".to_string();
-    }
-    match trimmed.rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(i) => trimmed[..i].to_string(),
-        None => "/".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod key_tests {
     use super::*;
@@ -5886,7 +5511,10 @@ mod key_tests {
     fn bare_alt_is_not_forwarded() {
         // Slint sends Alt-alone as key=0x12 with alt=true. It must produce no
         // bytes — otherwise it becomes ESC+0x12 and clears the input (issue #43).
-        assert_eq!(key_to_pty_bytes("\u{0012}", false, true, false), Vec::<u8>::new());
+        assert_eq!(
+            key_to_pty_bytes("\u{0012}", false, true, false),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -6021,7 +5649,13 @@ mod selection_tests {
         // scrolled to the top or sitting at the live bottom — this is the whole
         // point of the fix (a top-to-bottom selection survives auto-scrolling).
         let sel = |off| {
-            let mut b = make_buf(5, 20, &["HIST0", "HIST1", "HIST2"], &["LIVE0", "LIVE1"], off);
+            let mut b = make_buf(
+                5,
+                20,
+                &["HIST0", "HIST1", "HIST2"],
+                &["LIVE0", "LIVE1"],
+                off,
+            );
             b.sel_anchor = Some((0, 0));
             b.sel_focus = Some((4, 19));
             b.extract_selection_text()
@@ -6037,7 +5671,11 @@ mod selection_tests {
         top.sel_anchor = Some((0, 2));
         top.sel_focus = Some((2, 4));
         let rects = top.selection_rects_visible(20);
-        assert_eq!(rects.len(), 3, "rows 0,1,2 (the 3 history lines) highlighted");
+        assert_eq!(
+            rects.len(),
+            3,
+            "rows 0,1,2 (the 3 history lines) highlighted"
+        );
         assert_eq!(rects[0].row, 0);
         assert_eq!(rects[2].row, 2);
 

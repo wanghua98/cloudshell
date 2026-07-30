@@ -1,8 +1,8 @@
 //! Session / application configuration.
 //!
 //! Persists a simple JSON file under the platform's standard config dir
-//! (e.g. `%APPDATA%/meatshell/sessions.json` on Windows,
-//!  `~/.config/meatshell/sessions.json` on Linux/macOS).
+//! (e.g. `%APPDATA%/cloudshell/sessions.json` on Windows,
+//!  `~/.config/cloudshell/sessions.json` on Linux/macOS).
 //!
 //! ## Password encryption
 //!
@@ -62,7 +62,11 @@ impl Drop for Secret {
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never reveal the contents in logs / debug output.
-        f.write_str(if self.0.is_empty() { "Secret(\"\")" } else { "Secret(***)" })
+        f.write_str(if self.0.is_empty() {
+            "Secret(\"\")"
+        } else {
+            "Secret(***)"
+        })
     }
 }
 
@@ -272,7 +276,7 @@ pub struct ConfigFile {
     /// Theme preference: "system" (default) | "dark" | "light".
     #[serde(default)]
     pub theme_pref: String,
-    /// Terminal font family. Empty = the built-in default ("Meatshell Mono").
+    /// Terminal font family. Empty = the built-in default ("Cloudshell Mono").
     #[serde(default)]
     pub font_family: String,
     /// Terminal font size in px. 0 = the built-in default.
@@ -319,7 +323,7 @@ pub struct ConfigFile {
 
 /// Portable export file (issue #46): sessions with everything in plaintext
 /// **except** the password, which is encrypted with a fixed key baked into the
-/// binary so the file opens on *any* machine running meatshell.
+/// binary so the file opens on *any* machine running cloudshell.
 ///
 /// Security note: a built-in key in open-source code is **obfuscation, not real
 /// security** — anyone with the source can derive it. It only stops a casual
@@ -327,7 +331,7 @@ pub struct ConfigFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportFile {
     /// Format marker / version so the schema can evolve later.
-    meatshell_export: u32,
+    cloudshell_export: u32,
     sessions: Vec<Session>,
 }
 
@@ -362,7 +366,7 @@ impl ConfigStore {
 
     /// Fixed 32-byte key for portable exports. Baked into the binary so an
     /// exported file decrypts on any machine. Obfuscation only — see `ExportFile`.
-    const EXPORT_KEY: [u8; 32] = *b"meatshell.export.portable.key.01";
+    const EXPORT_KEY: [u8; 32] = *b"cloudshell.export.portable.key.1";
 
     // ── Encryption helpers ────────────────────────────────────────────────
 
@@ -376,7 +380,11 @@ impl ConfigStore {
             .map_err(|e| anyhow::anyhow!("password encrypt error: {e}"))?;
         let mut blob = nonce.to_vec();
         blob.extend_from_slice(&ciphertext);
-        Ok(format!("{}{}", Self::ENC_PREFIX, URL_SAFE_NO_PAD.encode(&blob)))
+        Ok(format!(
+            "{}{}",
+            Self::ENC_PREFIX,
+            URL_SAFE_NO_PAD.encode(&blob)
+        ))
     }
 
     /// Try to decrypt a value produced by [`Self::encrypt`].
@@ -418,15 +426,13 @@ impl ConfigStore {
 
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        fs::write(&key_path, &key)
+        fs::write(&key_path, key)
             .with_context(|| format!("failed to write {}", key_path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!("failed to set permissions on {}", key_path.display())
-                })?;
+                .with_context(|| format!("failed to set permissions on {}", key_path.display()))?;
         }
         tracing::info!("generated new encryption key at {}", key_path.display());
         Ok(key)
@@ -444,9 +450,8 @@ impl ConfigStore {
             .context("config path has no parent directory")?
             .to_path_buf();
 
-        fs::create_dir_all(&config_dir).with_context(|| {
-            format!("failed to create config dir {}", config_dir.display())
-        })?;
+        fs::create_dir_all(&config_dir)
+            .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
 
         let key = Self::load_or_create_key(&config_dir)?;
 
@@ -458,9 +463,7 @@ impl ConfigStore {
                     // Decrypt any encrypted passwords; leave legacy plaintext
                     // values untouched (they will be encrypted on next save).
                     for session in &mut cfg.sessions {
-                        if let Some(plain) =
-                            Self::try_decrypt(&key, session.password.as_str())
-                        {
+                        if let Some(plain) = Self::try_decrypt(&key, session.password.as_str()) {
                             session.password = Secret::new(plain);
                         }
                     }
@@ -487,7 +490,7 @@ impl ConfigStore {
     }
 
     fn config_path() -> Result<PathBuf> {
-        let dirs = ProjectDirs::from("dev", "meatshell", "meatshell")
+        let dirs = ProjectDirs::from("dev", "cloudshell", "cloudshell")
             .context("could not determine user config directory")?;
         Ok(dirs.config_dir().join("sessions.json"))
     }
@@ -502,12 +505,7 @@ impl ConfigStore {
     }
 
     pub fn upsert(&mut self, session: Session) {
-        if let Some(existing) = self
-            .cache
-            .sessions
-            .iter_mut()
-            .find(|s| s.id == session.id)
-        {
+        if let Some(existing) = self.cache.sessions.iter_mut().find(|s| s.id == session.id) {
             *existing = session;
         } else {
             self.cache.sessions.push(session);
@@ -795,8 +793,7 @@ impl ConfigStore {
         let raw = serde_json::to_string_pretty(&disk)?;
         // Write to a sibling temp file then rename — cheap atomicity.
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, &raw)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        fs::write(&tmp, &raw).with_context(|| format!("failed to write {}", tmp.display()))?;
         // Restrict to owner-only before publishing (#34): sessions.json holds
         // (encrypted) credentials, so it shouldn't be world-readable. Set 0600
         // on the temp file so the permission is already in place at rename.
@@ -823,7 +820,11 @@ impl ConfigStore {
             .map_err(|e| anyhow::anyhow!("export encrypt error: {e}"))?;
         let mut blob = nonce.to_vec();
         blob.extend_from_slice(&ciphertext);
-        Ok(format!("{}{}", Self::EXPORT_PREFIX, URL_SAFE_NO_PAD.encode(&blob)))
+        Ok(format!(
+            "{}{}",
+            Self::EXPORT_PREFIX,
+            URL_SAFE_NO_PAD.encode(&blob)
+        ))
     }
 
     /// Decrypt a value produced by [`Self::encrypt_export`]; `None` if it isn't one.
@@ -845,7 +846,7 @@ impl ConfigStore {
     /// file is human-readable and editable. Returns the number of sessions.
     pub fn export_to(&self, path: &Path) -> Result<usize> {
         let mut out = ExportFile {
-            meatshell_export: 1,
+            cloudshell_export: 1,
             sessions: self.cache.sessions.clone(),
         };
         for s in &mut out.sessions {
@@ -868,8 +869,8 @@ impl ConfigStore {
     pub fn import_from(&mut self, path: &Path) -> Result<(usize, usize)> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let file: ExportFile = serde_json::from_str(&raw)
-            .context("not a valid meatshell export file")?;
+        let file: ExportFile =
+            serde_json::from_str(&raw).context("not a valid cloudshell export file")?;
 
         let mut added = 0usize;
         let mut skipped = 0usize;
@@ -924,8 +925,7 @@ mod tests {
             ..Session::new_empty()
         });
 
-        let export_path =
-            std::env::temp_dir().join(format!("ms-exp-{}.json", Uuid::new_v4()));
+        let export_path = std::env::temp_dir().join(format!("ms-exp-{}.json", Uuid::new_v4()));
         assert_eq!(a.export_to(&export_path).unwrap(), 1);
 
         // The file keeps host/user plaintext but the password is obfuscated.
