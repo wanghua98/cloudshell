@@ -85,7 +85,19 @@ const PROMPT_PREFIX: &str = "test -z \"$FISH_VERSION\"";
 /// In particular, this keeps the timeout fallback safe for pwsh/cmd, which
 /// never produces the OSC 7 marker used by the normal path.
 fn strip_prompt_setup_echo(mut text: String) -> String {
-    if let Some(pos) = text.find(PROMPT_PREFIX) {
+    // SSH/PTY reads may begin in the middle of an echoed, terminal-wrapped
+    // line. Recognise both the stable command prefix and distinctive fragments
+    // from the hook so no continuation tail reaches the terminal.
+    let marker = [
+        PROMPT_PREFIX,
+        "PROMPT_COMMAND=\"__ms7",
+        "__ms7; else PROMPT_COMMAND",
+        "__ms7'",
+    ]
+    .into_iter()
+    .filter_map(|needle| text.find(needle))
+    .min();
+    if let Some(pos) = marker {
         // A PTY normally echoes Enter as CR (and may later add LF). Looking
         // only for LF let wrapped hook tails leak on servers that emit CR-only
         // prompts.
@@ -98,6 +110,11 @@ fn strip_prompt_setup_echo(mut text: String) -> String {
                 line_end += 1;
             }
             text.replace_range(start..line_end, "");
+        } else {
+            // A wrapped continuation can be the complete read; it is still
+            // unquestionably our internal hook, so don't expose it merely
+            // because the prompt arrives in a later read.
+            text.replace_range(start.., "");
         }
     }
     text
@@ -914,6 +931,9 @@ async fn run_session(
                                 let _ = events.send(SessionEvent::CommandRan(cmd.to_string()));
                             }
                         }
+                        // Safety net for a hook echo split at a PTY read or
+                        // terminal-wrap boundary after suppression has ended.
+                        text = strip_prompt_setup_echo(text);
 
                         let _ = events.send(SessionEvent::Output(text));
                     }
@@ -1503,6 +1523,12 @@ mod osc_command_tests {
             strip_prompt_setup_echo(text.into()),
             "banner\rroot@host:~# "
         );
+    }
+
+    #[test]
+    fn removes_wrapped_hook_tail_without_the_prefix() {
+        let text = "<__ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'\rroot@host:~# ";
+        assert_eq!(strip_prompt_setup_echo(text.into()), "root@host:~# ");
     }
 }
 
