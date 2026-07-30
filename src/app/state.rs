@@ -3,7 +3,7 @@
 //! Keeping these data-only types outside the callback wiring makes the UI
 //! coordinator smaller and gives subsequent feature work a stable boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::ssh::ProcInfo;
@@ -19,8 +19,14 @@ pub(crate) struct TermBuffer {
     pub(crate) is_dark: bool,
     pub(crate) sel_anchor: Option<(usize, u16)>,
     pub(crate) sel_focus: Option<(usize, u16)>,
-    pub(crate) history: Vec<Line>,
-    pub(crate) prev: Vec<Line>,
+    pub(crate) history: VecDeque<Line>,
+    /// Cached rendering of the current vt100 screen. This is also the previous
+    /// screen used by scroll detection before the parser consumes new bytes.
+    pub(crate) live: Vec<Line>,
+    /// Full-screen redraws and alternate-screen transitions deliberately break
+    /// scroll-history continuity; the next ordinary update establishes a fresh
+    /// baseline instead of treating the redraw as scrolled output.
+    pub(crate) history_baseline_valid: bool,
     pub(crate) view_offset: usize,
     pub(crate) displayed_text: Vec<String>,
     pub(crate) csi_state: CsiState,

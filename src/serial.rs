@@ -154,8 +154,10 @@ async fn run_serial(
             match port.read(&mut buf) {
                 Ok(0) => {}
                 Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    if reader_events.send(SessionEvent::Output(text)).is_err() {
+                    if reader_events
+                        .send(SessionEvent::Output(buf[..n].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }

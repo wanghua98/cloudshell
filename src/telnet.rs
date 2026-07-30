@@ -194,8 +194,7 @@ async fn run_telnet(
                             let _ = wr.flush().await;
                         }
                         if !data.is_empty() {
-                            let text = String::from_utf8_lossy(&data).into_owned();
-                            let _ = events.send(SessionEvent::Output(text));
+                            let _ = events.send(SessionEvent::Output(data));
                         }
                     }
                     Err(e) => {

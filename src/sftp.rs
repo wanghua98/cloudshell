@@ -1393,8 +1393,40 @@ fn emit_transfer(
 /// Returns `Ok(true)` when the whole file was written, or `Ok(false)` if the
 /// transfer was cancelled. In both the cancel and error cases the partial
 /// local file is removed so no half-downloaded junk is left behind.
+async fn open_transfer_session(
+    handle: &client::Handle<SftpClientHandler>,
+    purpose: &str,
+) -> Result<Arc<RawSftpSession>> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .with_context(|| format!("open SFTP {purpose} channel"))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .with_context(|| format!("request SFTP subsystem for {purpose}"))?;
+    let raw = Arc::new(RawSftpSession::new(channel.into_stream()));
+    raw.init()
+        .await
+        .with_context(|| format!("SFTP {purpose} handshake"))?;
+    Ok(raw)
+}
+
 async fn download_impl(
     handle: &client::Handle<SftpClientHandler>,
+    remote: &str,
+    local: &str,
+    name: &str,
+    id: &str,
+    events: &UnboundedSender<SessionEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<bool> {
+    let raw = open_transfer_session(handle, "download").await?;
+    download_with_session(&raw, remote, local, name, id, events, cancel).await
+}
+
+async fn download_with_session(
+    raw: &Arc<RawSftpSession>,
     remote: &str,
     local: &str,
     name: &str,
@@ -1406,17 +1438,6 @@ async fn download_impl(
 
     const CHUNK: usize = 32 * 1024;
     const MAX_INFLIGHT: usize = 32; // ~1 MB outstanding hides the RTT
-
-    let channel = handle
-        .channel_open_session()
-        .await
-        .context("open sftp download channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("request sftp subsystem")?;
-    let raw = Arc::new(RawSftpSession::new(channel.into_stream()));
-    raw.init().await.context("sftp download handshake")?;
 
     let total = raw
         .stat(remote)
@@ -1579,6 +1600,9 @@ async fn download_dir(
     let no_cancel = Arc::new(AtomicBool::new(false));
     let root_name = sanitize_filename(&base_name(remote_root));
     let root_local = format!("{}/{}", local_parent.trim_end_matches('/'), root_name);
+    // Reuse one raw SFTP subsystem for the whole tree. Opening and handshaking
+    // a fresh SSH channel for every small file dominates directory transfers.
+    let transfer_session = open_transfer_session(handle, "directory download").await?;
     // (remote_dir, local_dir) pairs still to mirror.
     let mut stack = vec![(remote_root.trim_end_matches('/').to_string(), root_local)];
     while let Some((rdir, ldir)) = stack.pop() {
@@ -1593,8 +1617,8 @@ async fn download_dir(
                 let fname = sanitize_filename(&entry.name);
                 let lpath = format!("{}/{}", ldir, fname);
                 let id = Uuid::new_v4().to_string();
-                download_impl(
-                    handle,
+                download_with_session(
+                    &transfer_session,
                     &entry.full_path,
                     &lpath,
                     &fname,
@@ -1656,6 +1680,7 @@ async fn upload_dir(
     let no_cancel = Arc::new(AtomicBool::new(false));
     let root_name = base_name(local_root);
     let remote_root = format!("{}/{}", remote_parent.trim_end_matches('/'), root_name);
+    let transfer_session = open_transfer_session(handle, "directory upload").await?;
     let mut stack = vec![(local_root.to_string(), remote_root)];
     while let Some((ldir, rdir)) = stack.pop() {
         // Best-effort mkdir; an error usually just means the dir already exists.
@@ -1672,7 +1697,16 @@ async fn upload_dir(
                 stack.push((lpath, rchild));
             } else if ft.is_file() {
                 let id = Uuid::new_v4().to_string();
-                upload_pipelined(handle, &lpath, &rchild, &name, &id, events, &no_cancel).await?;
+                upload_with_session(
+                    &transfer_session,
+                    &lpath,
+                    &rchild,
+                    &name,
+                    &id,
+                    events,
+                    &no_cancel,
+                )
+                .await?;
             }
         }
     }
@@ -1697,6 +1731,19 @@ async fn upload_pipelined(
     events: &UnboundedSender<SessionEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<bool> {
+    let raw = open_transfer_session(handle, "upload").await?;
+    upload_with_session(&raw, local, remote, name, id, events, cancel).await
+}
+
+async fn upload_with_session(
+    raw: &Arc<RawSftpSession>,
+    local: &str,
+    remote: &str,
+    name: &str,
+    id: &str,
+    events: &UnboundedSender<SessionEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<bool> {
     use tokio::io::AsyncReadExt;
 
     const CHUNK: usize = 32 * 1024; // safe SFTP write size
@@ -1709,19 +1756,6 @@ async fn upload_pipelined(
     let mut local_file = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("open local {local}"))?;
-
-    // Dedicated raw SFTP channel for the transfer (keeps the browse session
-    // responsive and lets us issue concurrent WRITE requests).
-    let channel = handle
-        .channel_open_session()
-        .await
-        .context("open sftp upload channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("request sftp subsystem")?;
-    let raw = Arc::new(RawSftpSession::new(channel.into_stream()));
-    raw.init().await.context("sftp upload handshake")?;
 
     let fhandle = raw
         .open(

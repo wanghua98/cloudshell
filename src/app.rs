@@ -1934,8 +1934,9 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                     is_dark: is_dark_now,
                     sel_anchor: None,
                     sel_focus: None,
-                    history: Vec::new(),
-                    prev: Vec::new(),
+                    history: VecDeque::new(),
+                    live: Vec::new(),
+                    history_baseline_valid: false,
                     view_offset: 0,
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
@@ -2055,9 +2056,10 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
+            let mut pending_event = None;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             loop {
-                match shell_rx.blocking_recv() {
+                match recv_coalesced_output(&mut shell_rx, &mut pending_event) {
                     None => break,
                     Some(shell_evt) => {
                         if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
@@ -2147,6 +2149,43 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
             }
         });
     }
+}
+
+/// Receive one shell event, joining already-queued adjacent output chunks.
+///
+/// Network reads are often much smaller and more frequent than UI frames. A
+/// bounded batch preserves byte order and event ordering while avoiding one
+/// event-loop allocation and full terminal render per packet.
+fn recv_coalesced_output(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    pending: &mut Option<SessionEvent>,
+) -> Option<SessionEvent> {
+    const MAX_OUTPUT_BATCH: usize = 256 * 1024;
+
+    let mut event = match pending.take() {
+        Some(event) => event,
+        None => receiver.blocking_recv()?,
+    };
+    let SessionEvent::Output(bytes) = &mut event else {
+        return Some(event);
+    };
+
+    while bytes.len() < MAX_OUTPUT_BATCH {
+        match receiver.try_recv() {
+            Ok(SessionEvent::Output(next))
+                if bytes.len().saturating_add(next.len()) <= MAX_OUTPUT_BATCH =>
+            {
+                bytes.extend_from_slice(&next);
+            }
+            Ok(next) => {
+                *pending = Some(next);
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    Some(event)
 }
 
 /// Map of tab-id → the SFTP panel's current path, read from the terminals
@@ -2394,7 +2433,7 @@ fn apply_session_event_to_window(
                 if let Some(buf) = map.get_mut(tab_id) {
                     // Capture scrolled-off lines into history, then render the
                     // current view (live or scrolled-back).
-                    buf.ingest(chunk.as_bytes());
+                    buf.ingest(&chunk);
                     let cols = buf.parser.screen().size().1;
                     let b = buf.render(); // refreshes buf.displayed_text
                     let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
@@ -2443,13 +2482,16 @@ fn apply_session_event_to_window(
             apply_session_event_to_window(
                 win,
                 tab_id,
-                SessionEvent::Output(format!(
-                    "\r\n\x1b[31m{}\x1b[0m\r\n",
-                    crate::i18n::t(
-                        "连接已断开,按 Enter 重新连接",
-                        "Disconnected — press Enter to reconnect"
+                SessionEvent::Output(
+                    format!(
+                        "\r\n\x1b[31m{}\x1b[0m\r\n",
+                        crate::i18n::t(
+                            "连接已断开,按 Enter 重新连接",
+                            "Disconnected — press Enter to reconnect"
+                        )
                     )
-                )),
+                    .into_bytes(),
+                ),
                 bufs,
                 statuses,
                 local,
@@ -2565,12 +2607,15 @@ fn apply_session_event_to_window(
                 apply_session_event_to_window(
                     win,
                     tab_id,
-                    SessionEvent::Output(format!(
-                        "\r\n[cloudshell] {} {}: {}\r\n",
-                        crate::i18n::t("无法打开", "Cannot open"),
-                        name,
-                        error
-                    )),
+                    SessionEvent::Output(
+                        format!(
+                            "\r\n[cloudshell] {} {}: {}\r\n",
+                            crate::i18n::t("无法打开", "Cannot open"),
+                            name,
+                            error
+                        )
+                        .into_bytes(),
+                    ),
                     bufs,
                     statuses,
                     local,
@@ -4024,7 +4069,8 @@ fn wire_key_input(
                             let (rows, cols) = b.parser.screen().size();
                             b.parser = vt100::Parser::new(rows, cols, 5000);
                             b.history.clear();
-                            b.prev.clear();
+                            b.live.clear();
+                            b.history_baseline_valid = false;
                             b.displayed_text.clear();
                             b.view_offset = 0;
                             b.sel_anchor = None;
@@ -4318,11 +4364,7 @@ fn wire_key_input(
                             (0..scroll).map(|r| build_row(s, r, old_cols)).collect()
                         };
                         for line in saved {
-                            buf.history.push(line);
-                        }
-                        if buf.history.len() > MAX_HISTORY {
-                            let drop = buf.history.len() - MAX_HISTORY;
-                            buf.history.drain(0..drop);
+                            buf.push_history(line);
                         }
                         buf.parser.process(format!("\x1b[{scroll}S").as_bytes());
                     }
@@ -4331,7 +4373,8 @@ fn wire_key_input(
                 // The pre/post-resize screens differ in size+content; drop the
                 // scroll-detection snapshot so the next output isn't mis-read as
                 // a scroll (which would double-capture lines).
-                buf.prev.clear();
+                buf.refresh_live();
+                buf.history_baseline_valid = false;
             }
         });
     }
@@ -4404,8 +4447,9 @@ fn wire_key_input(
                 let (rows, cols) = buf.parser.screen().size();
                 buf.parser = vt100::Parser::new(rows, cols, 5000);
                 buf.find_query.clear();
-                buf.history = Vec::new(); // recycle the session scrollback
-                buf.prev = Vec::new();
+                buf.history.clear(); // recycle the session scrollback
+                buf.live.clear();
+                buf.history_baseline_valid = false;
                 buf.view_offset = 0;
                 buf.sel_anchor = None;
                 buf.sel_focus = None;
@@ -5058,15 +5102,43 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
 /// finding the vertical shift `k` that best aligns `prev` onto `curr` (longest
 /// top-anchored run of equal plain-text lines).  `k` lines left the top.
 fn detect_scroll(prev: &[Line], curr: &[Line]) -> usize {
+    if prev.is_empty() || curr.is_empty() {
+        return 0;
+    }
+
+    // Z-algorithm over whole rows:
+    //
+    //   curr + sentinel + prev
+    //
+    // The Z value at each row in `prev` is exactly the number of leading rows
+    // shared with `curr`. Unlike trying every shift independently, the Z window
+    // reuses earlier comparisons, so this performs O(rows) row comparisons.
+    let mut sequence: Vec<Option<&str>> = Vec::with_capacity(curr.len() + prev.len() + 1);
+    sequence.extend(curr.iter().map(|line| Some(line.0.as_str())));
+    sequence.push(None);
+    sequence.extend(prev.iter().map(|line| Some(line.0.as_str())));
+
+    let mut z = vec![0usize; sequence.len()];
+    let (mut left, mut right) = (0usize, 0usize);
+    for i in 1..sequence.len() {
+        if i <= right {
+            z[i] = z[i - left].min(right - i + 1);
+        }
+        while i + z[i] < sequence.len() && sequence[z[i]] == sequence[i + z[i]] {
+            z[i] += 1;
+        }
+        if z[i] > 0 && i + z[i] - 1 > right {
+            left = i;
+            right = i + z[i] - 1;
+        }
+    }
+
     let mut best_k = 0usize;
     let mut best_len = 0usize;
     for k in 0..prev.len() {
-        let mut p = 0usize;
-        while k + p < prev.len() && p < curr.len() && prev[k + p].0 == curr[p].0 {
-            p += 1;
-        }
-        if p > best_len {
-            best_len = p;
+        let matched = z[curr.len() + 1 + k].min(curr.len()).min(prev.len() - k);
+        if matched > best_len {
+            best_len = matched;
             best_k = k;
         }
     }
@@ -5074,6 +5146,19 @@ fn detect_scroll(prev: &[Line], curr: &[Line]) -> usize {
 }
 
 impl TermBuffer {
+    fn push_history(&mut self, line: Line) {
+        if self.history.len() == MAX_HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(line);
+    }
+
+    fn refresh_live(&mut self) {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        self.live = (0..rows).map(|row| build_row(screen, row, cols)).collect();
+    }
+
     // ---- Absolute-coordinate selection helpers (#18 follow-up) -------------
     //
     // The "combined" buffer is `history` (oldest first) followed by the live
@@ -5081,16 +5166,14 @@ impl TermBuffer {
     // top index depends on whether we're at the live bottom or scrolled up.
 
     /// Live screen rows plus the count of non-blank ones at the top.
-    fn live_rows(&self) -> (Vec<Line>, usize) {
-        let s = self.parser.screen();
-        let (rows, cols) = s.size();
-        let live: Vec<Line> = (0..rows).map(|r| build_row(s, r, cols)).collect();
-        let used = live
+    fn live_rows(&self) -> (&[Line], usize) {
+        let used = self
+            .live
             .iter()
             .rposition(|(_, runs)| !runs.is_empty())
             .map(|i| i + 1)
             .unwrap_or(0);
-        (live, used)
+        (&self.live, used)
     }
 
     /// Absolute combined-row index of the top visible row for the current view.
@@ -5220,7 +5303,7 @@ impl TermBuffer {
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
         let bytes = self.rewrite_hvp(raw);
-        let bytes = &bytes[..];
+        let bytes = bytes.as_ref();
         let rows = self.parser.screen().size().0 as usize;
         let batch_lines = (rows / 2).max(1);
         let mut start = 0usize;
@@ -5244,7 +5327,12 @@ impl TermBuffer {
     /// sequence terminated by `H` (CUP).  The scanner state persists across
     /// calls, so a sequence split across read chunks is still handled.  Only the
     /// final byte of a CSI sequence is ever touched; text bytes pass through.
-    fn rewrite_hvp(&mut self, input: &[u8]) -> Vec<u8> {
+    fn rewrite_hvp<'a>(&mut self, input: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        // Ordinary terminal text contains no ESC at all. Avoid allocating and
+        // copying that overwhelmingly common path.
+        if self.csi_state == CsiState::Normal && !input.contains(&0x1b) {
+            return std::borrow::Cow::Borrowed(input);
+        }
         let mut out = Vec::with_capacity(input.len());
         for &b in input {
             match self.csi_state {
@@ -5280,7 +5368,7 @@ impl TermBuffer {
                 }
             }
         }
-        out
+        std::borrow::Cow::Owned(out)
     }
 
     /// Process one bounded batch and capture any lines that scrolled off the top
@@ -5302,63 +5390,53 @@ impl TermBuffer {
             let (r, c) = s.size();
             (s.alternate_screen(), r, c)
         };
-        if is_alt {
-            // Snap to live view whenever we're on the alt screen — this
-            // prevents old history (accumulated before alt-screen was entered)
-            // from mixing with the full-screen program's output after a scroll.
-            self.view_offset = 0;
-            self.prev.clear();
-            return;
-        }
-        if is_fullscreen_refresh {
-            // Non-alt-screen full-screen refresh (btop, htop with alt disabled…).
-            // Don't capture lines into history; they'd mix with the next frame.
-            self.view_offset = 0;
-            self.prev.clear();
-            return;
-        }
         let curr: Vec<Line> = {
             let s = self.parser.screen();
             (0..rows).map(|r| build_row(s, r, cols)).collect()
         };
-        if !self.prev.is_empty() {
-            let k = detect_scroll(&self.prev, &curr);
-            for line in self.prev.iter().take(k) {
-                self.history.push(line.clone());
+        if is_alt || is_fullscreen_refresh {
+            // Keep the current rows cached for rendering, but deliberately
+            // break history continuity across a full-screen frame.
+            self.view_offset = 0;
+            self.history_baseline_valid = false;
+        } else if self.history_baseline_valid {
+            let k = detect_scroll(&self.live, &curr);
+            for index in 0..k {
+                let line = self.live[index].clone();
+                self.push_history(line);
             }
-            if self.history.len() > MAX_HISTORY {
-                let drop = self.history.len() - MAX_HISTORY;
-                self.history.drain(0..drop);
-            }
+        } else {
+            self.history_baseline_valid = true;
         }
-        self.prev = curr;
+        self.live = curr;
     }
 
     /// Render the terminal grid for the current scrollback `view_offset`
     /// (0 = live).  Caches the displayed plain text for find/selection.
     fn render(&mut self) -> BuiltScreen {
-        let (is_alt, rows, cols, cur_row, cur_col) = {
+        let (is_alt, rows, cur_row, cur_col) = {
             let s = self.parser.screen();
-            let (r, c) = s.size();
+            let (r, _) = s.size();
             let (cr, cc) = s.cursor_position();
-            (s.alternate_screen(), r, c, cr, cc)
+            (s.alternate_screen(), r, cr, cc)
         };
+        if self.live.len() != rows as usize {
+            self.refresh_live();
+        }
 
         // --- Live view (also alt-screen): render the current grid -----------
         if is_alt || self.view_offset == 0 {
             let mut spans = Vec::new();
             let mut displayed = Vec::with_capacity(rows as usize);
             let mut last_content = 0i32;
-            let s = self.parser.screen();
-            for r in 0..rows {
-                let (plain, runs) = build_row(s, r, cols);
+            for (r, (plain, runs)) in self.live.iter().enumerate() {
                 if !runs.is_empty() {
                     last_content = r as i32;
                 }
                 for hs in runs {
                     spans.push(TermSpan {
                         cjk: contains_cjk(&hs.text),
-                        text: hs.text.into(),
+                        text: hs.text.clone().into(),
                         fg: vt_color_to_slint(hs.fg, hs.bold, self.is_dark),
                         bg: vt_bg_to_slint(hs.bg, self.is_dark),
                         bold: hs.bold,
@@ -5387,10 +5465,7 @@ impl TermBuffer {
         }
 
         // --- Scrolled view: window into history ++ live content -------------
-        let live: Vec<Line> = {
-            let s = self.parser.screen();
-            (0..rows).map(|r| build_row(s, r, cols)).collect()
-        };
+        let live = &self.live;
         let hist_len = self.history.len();
         // Include the screen's trailing blank rows in the scroll range so this
         // scrolled view stays continuous with the live view (view_offset 0).
@@ -5825,6 +5900,10 @@ mod selection_tests {
     ) -> TermBuffer {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(live_lines.join("\r\n").as_bytes());
+        let live = {
+            let screen = parser.screen();
+            (0..rows).map(|row| build_row(screen, row, cols)).collect()
+        };
         TermBuffer {
             parser,
             find_query: String::new(),
@@ -5832,7 +5911,8 @@ mod selection_tests {
             sel_anchor: None,
             sel_focus: None,
             history: history.iter().map(|s| hist_line(s)).collect(),
-            prev: Vec::new(),
+            live,
+            history_baseline_valid: true,
             view_offset,
             displayed_text: Vec::new(),
             csi_state: CsiState::Normal,
@@ -5905,5 +5985,98 @@ mod selection_tests {
         live.sel_anchor = Some((0, 2));
         live.sel_focus = Some((2, 4));
         assert!(live.selection_rects_visible(20).is_empty());
+    }
+
+    #[test]
+    fn linear_scroll_match_finds_longest_overlap() {
+        let lines = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| hist_line(value))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            detect_scroll(&lines(&["A", "B", "C", "D"]), &lines(&["C", "D", "E", "F"])),
+            2
+        );
+        // Repeated rows exercise the Z-window reuse: k=1 matches two rows,
+        // whereas k=0 matches only the first row.
+        assert_eq!(
+            detect_scroll(&lines(&["same", "same", "tail"]), &lines(&["same", "tail"])),
+            1
+        );
+        assert_eq!(detect_scroll(&lines(&["A", "B"]), &lines(&["X", "Y"])), 0);
+    }
+
+    #[test]
+    fn linear_scroll_match_preserves_reference_semantics() {
+        fn reference(prev: &[Line], curr: &[Line]) -> usize {
+            let mut best = (0usize, 0usize);
+            for shift in 0..prev.len() {
+                let matched = prev[shift..]
+                    .iter()
+                    .zip(curr)
+                    .take_while(|(left, right)| left.0 == right.0)
+                    .count();
+                if matched > best.1 {
+                    best = (shift, matched);
+                }
+            }
+            best.0
+        }
+
+        // Exhaust every four-row A/B screen pair, including repeated and
+        // ambiguous rows where overlap algorithms commonly get tie-breaking
+        // wrong. The optimized implementation must match the old semantics.
+        for prev_bits in 0u8..16 {
+            for curr_bits in 0u8..16 {
+                let make = |bits: u8| {
+                    (0..4)
+                        .map(|bit| hist_line(if bits & (1 << bit) == 0 { "A" } else { "B" }))
+                        .collect::<Vec<_>>()
+                };
+                let prev = make(prev_bits);
+                let curr = make(curr_bits);
+                assert_eq!(detect_scroll(&prev, &curr), reference(&prev, &curr));
+            }
+        }
+    }
+
+    #[test]
+    fn split_utf8_bytes_survive_terminal_ingest() {
+        let mut buf = make_buf(3, 20, &[], &[], 0);
+        let bytes = "你".as_bytes();
+        buf.ingest(&bytes[..1]);
+        buf.ingest(&bytes[1..]);
+        let _ = buf.render();
+        assert_eq!(buf.displayed_text[0], "你");
+    }
+
+    #[test]
+    fn shell_output_coalescing_preserves_event_order() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(SessionEvent::Output(b"one".to_vec())).unwrap();
+        sender.send(SessionEvent::Output(b"-two".to_vec())).unwrap();
+        sender.send(SessionEvent::Status("ready".into())).unwrap();
+        sender
+            .send(SessionEvent::Output(b"three".to_vec()))
+            .unwrap();
+        drop(sender);
+
+        let mut pending = None;
+        match recv_coalesced_output(&mut receiver, &mut pending) {
+            Some(SessionEvent::Output(bytes)) => assert_eq!(bytes, b"one-two"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match recv_coalesced_output(&mut receiver, &mut pending) {
+            Some(SessionEvent::Status(status)) => assert_eq!(status, "ready"),
+            other => panic!("unexpected second event: {other:?}"),
+        }
+        match recv_coalesced_output(&mut receiver, &mut pending) {
+            Some(SessionEvent::Output(bytes)) => assert_eq!(bytes, b"three"),
+            other => panic!("unexpected third event: {other:?}"),
+        }
+        assert!(recv_coalesced_output(&mut receiver, &mut pending).is_none());
     }
 }

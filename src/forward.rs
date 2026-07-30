@@ -20,7 +20,9 @@ use crate::ssh::{ClientHandler, SessionEvent};
 
 /// Emit a one-line notice into the terminal output stream.
 fn notice(events: &UnboundedSender<SessionEvent>, msg: String) {
-    let _ = events.send(SessionEvent::Output(format!("\r\n[cloudshell] {msg}\r\n")));
+    let _ = events.send(SessionEvent::Output(
+        format!("\r\n[cloudshell] {msg}\r\n").into_bytes(),
+    ));
 }
 
 fn bind_target(bind_addr: &str, bind_port: u16) -> String {

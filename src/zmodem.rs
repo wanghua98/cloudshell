@@ -221,12 +221,15 @@ pub async fn receive(
         .await;
     }
 
-    let _ = events.send(SessionEvent::Output(format!(
-        "\r\n[cloudshell] {} {} → {}\r\n",
-        received,
-        t("个文件已通过 sz 下载到", "file(s) downloaded via sz to"),
-        dest.display()
-    )));
+    let _ = events.send(SessionEvent::Output(
+        format!(
+            "\r\n[cloudshell] {} {} → {}\r\n",
+            received,
+            t("个文件已通过 sz 下载到", "file(s) downloaded via sz to"),
+            dest.display()
+        )
+        .into_bytes(),
+    ));
     // Hand back any trailing bytes (the shell prompt) so the caller can display
     // them instead of the receiver swallowing them.
     Ok(rx.buf.drain(..).collect())
@@ -359,37 +362,49 @@ impl<'a> Rx<'a> {
     /// byte (ZCRCE/ZCRCG/ZCRCQ/ZCRCW). The CRC covers data + terminator.
     async fn read_subpacket(&mut self, crc32: bool) -> Result<(Vec<u8>, u8)> {
         let mut data = Vec::new();
+        let mut crc16_state = 0u16;
+        let mut crc32_state = 0xFFFF_FFFFu32;
         loop {
             let b = self.byte().await?;
             if b != ZDLE {
                 data.push(b);
+                update_subpacket_crc(b, crc32, &mut crc16_state, &mut crc32_state);
                 continue;
             }
             let e = self.byte().await?;
             match e {
                 ZCRCE | ZCRCG | ZCRCQ | ZCRCW => {
-                    let mut crcbuf = data.clone();
-                    crcbuf.push(e);
+                    update_subpacket_crc(e, crc32, &mut crc16_state, &mut crc32_state);
                     if crc32 {
                         let mut c = [0u8; 4];
                         for x in c.iter_mut() {
                             *x = self.zbyte().await?;
                         }
-                        if crc32_of(&crcbuf) != u32::from_le_bytes(c) {
+                        if !crc32_state != u32::from_le_bytes(c) {
                             bail!("subpacket CRC-32 mismatch");
                         }
                     } else {
                         let hi = self.zbyte().await?;
                         let lo = self.zbyte().await?;
-                        if crc16(&crcbuf) != u16::from_be_bytes([hi, lo]) {
+                        if crc16_state != u16::from_be_bytes([hi, lo]) {
                             bail!("subpacket CRC-16 mismatch");
                         }
                     }
                     return Ok((data, e));
                 }
-                ZRUB0 => data.push(0x7f),
-                ZRUB1 => data.push(0xff),
-                _ => data.push(e ^ 0x40),
+                ZRUB0 => {
+                    data.push(0x7f);
+                    update_subpacket_crc(0x7f, crc32, &mut crc16_state, &mut crc32_state);
+                }
+                ZRUB1 => {
+                    data.push(0xff);
+                    update_subpacket_crc(0xff, crc32, &mut crc16_state, &mut crc32_state);
+                }
+                _ => {
+                    let decoded = e ^ 0x40;
+                    data.push(decoded);
+                    update_subpacket_crc(decoded, crc32, &mut crc16_state, &mut crc32_state);
+                }
             }
         }
     }
@@ -490,36 +505,73 @@ fn from_hex(c: u8) -> Result<u8> {
     }
 }
 
-/// CRC-16/XMODEM (poly 0x1021, init 0, no final xor) — ZMODEM header/subpacket.
-fn crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0;
-    for &b in data {
-        crc ^= (b as u16) << 8;
-        for _ in 0..8 {
+const fn make_crc16_table() -> [u16; 256] {
+    let mut table = [0u16; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut crc = (index as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x1021
             } else {
                 crc << 1
             };
+            bit += 1;
         }
+        table[index] = crc;
+        index += 1;
     }
-    crc
+    table
 }
 
-/// CRC-32/ISO-HDLC (zlib): init 0xFFFFFFFF, reflected, final xor 0xFFFFFFFF.
-fn crc32_of(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
+const fn make_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 1 != 0 {
                 (crc >> 1) ^ 0xEDB8_8320
             } else {
                 crc >> 1
             };
+            bit += 1;
         }
+        table[index] = crc;
+        index += 1;
     }
-    !crc
+    table
+}
+
+const CRC16_TABLE: [u16; 256] = make_crc16_table();
+const CRC32_TABLE: [u32; 256] = make_crc32_table();
+
+fn crc16_byte(crc: u16, byte: u8) -> u16 {
+    (crc << 8) ^ CRC16_TABLE[((crc >> 8) as u8 ^ byte) as usize]
+}
+
+fn crc32_byte(crc: u32, byte: u8) -> u32 {
+    (crc >> 8) ^ CRC32_TABLE[((crc as u8) ^ byte) as usize]
+}
+
+fn update_subpacket_crc(byte: u8, use_crc32: bool, crc16_state: &mut u16, crc32_state: &mut u32) {
+    if use_crc32 {
+        *crc32_state = crc32_byte(*crc32_state, byte);
+    } else {
+        *crc16_state = crc16_byte(*crc16_state, byte);
+    }
+}
+
+/// CRC-16/XMODEM (poly 0x1021, init 0, no final xor) — ZMODEM header/subpacket.
+fn crc16(data: &[u8]) -> u16 {
+    data.iter().copied().fold(0, crc16_byte)
+}
+
+/// CRC-32/ISO-HDLC (zlib): init 0xFFFFFFFF, reflected, final xor 0xFFFFFFFF.
+fn crc32_of(data: &[u8]) -> u32 {
+    !data.iter().copied().fold(0xFFFF_FFFF, crc32_byte)
 }
 
 #[cfg(test)]

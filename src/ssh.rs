@@ -81,43 +81,57 @@ const ZMODEM_CANCEL: [u8; 16] = [
 
 const PROMPT_PREFIX: &str = "test -z \"$FISH_VERSION\"";
 
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 /// Remove a complete echoed POSIX integration line, if the server returned one.
 /// In particular, this keeps the timeout fallback safe for pwsh/cmd, which
 /// never produces the OSC 7 marker used by the normal path.
-fn strip_prompt_setup_echo(mut text: String) -> String {
+fn strip_prompt_setup_echo(mut bytes: Vec<u8>) -> Vec<u8> {
     // SSH/PTY reads may begin in the middle of an echoed, terminal-wrapped
     // line. Recognise both the stable command prefix and distinctive fragments
     // from the hook so no continuation tail reaches the terminal.
     let marker = [
-        PROMPT_PREFIX,
-        "PROMPT_COMMAND=\"__ms7",
-        "__ms7; else PROMPT_COMMAND",
-        "__ms7'",
+        PROMPT_PREFIX.as_bytes(),
+        b"PROMPT_COMMAND=\"__ms7".as_slice(),
+        b"__ms7; else PROMPT_COMMAND".as_slice(),
+        b"__ms7'".as_slice(),
     ]
     .into_iter()
-    .filter_map(|needle| text.find(needle))
+    .filter_map(|needle| find_bytes(&bytes, needle))
     .min();
     if let Some(pos) = marker {
         // A PTY normally echoes Enter as CR (and may later add LF). Looking
         // only for LF let wrapped hook tails leak on servers that emit CR-only
         // prompts.
-        let start = text[..pos].rfind(['\r', '\n']).map(|i| i + 1).unwrap_or(0);
-        if let Some(end) = text[pos..].find(['\r', '\n']) {
+        let start = bytes[..pos]
+            .iter()
+            .rposition(|byte| matches!(byte, b'\r' | b'\n'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if let Some(end) = bytes[pos..]
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+        {
             let mut line_end = pos + end + 1;
-            if text.as_bytes().get(line_end - 1) == Some(&b'\r')
-                && text.as_bytes().get(line_end) == Some(&b'\n')
-            {
+            if bytes.get(line_end - 1) == Some(&b'\r') && bytes.get(line_end) == Some(&b'\n') {
                 line_end += 1;
             }
-            text.replace_range(start..line_end, "");
+            bytes.drain(start..line_end);
         } else {
             // A wrapped continuation can be the complete read; it is still
             // unquestionably our internal hook, so don't expose it merely
             // because the prompt arrives in a later read.
-            text.replace_range(start.., "");
+            bytes.truncate(start);
         }
     }
-    text
+    bytes
 }
 
 /// Detect the start of a ZMODEM transfer (sz/rz) in a raw channel chunk.
@@ -135,15 +149,15 @@ fn contains_zmodem_init(data: &[u8]) -> bool {
 ///
 /// Format: `ESC ] 7 ; file://hostname/path BEL`
 /// Returns the decoded absolute path component (without hostname).
+#[cfg(test)]
 pub fn extract_osc7_path(text: &str) -> Option<String> {
-    extract_osc7_end(text).map(|(path, _)| path)
+    extract_osc7_end_bytes(text.as_bytes()).map(|(path, _)| path)
 }
 
 /// Like [`extract_osc7_path`] but also returns the byte index just past the OSC
 /// sequence's terminator, so the caller can cut everything up to and including
 /// it — used to discard the echoed setup line (which may wrap) at connect (#98).
-fn extract_osc7_end(text: &str) -> Option<(String, usize)> {
-    let bytes = text.as_bytes();
+fn extract_osc7_end_bytes(bytes: &[u8]) -> Option<(String, usize)> {
     let mut i = 0;
     while i + 1 < bytes.len() {
         if bytes[i] != 0x1b || bytes[i + 1] != b']' {
@@ -191,8 +205,12 @@ fn extract_osc7_end(text: &str) -> Option<(String, usize)> {
 /// range of the whole escape sequence, so the caller can strip it before the
 /// text is rendered. An incomplete sequence (terminator not yet received)
 /// yields `None` — vt100 buffers it and the next chunk completes it.
+#[cfg(test)]
 pub fn extract_osc_command(text: &str) -> Option<(String, std::ops::Range<usize>)> {
-    let bytes = text.as_bytes();
+    extract_osc_command_bytes(text.as_bytes())
+}
+
+fn extract_osc_command_bytes(bytes: &[u8]) -> Option<(String, std::ops::Range<usize>)> {
     let mut i = 0;
     while i + 1 < bytes.len() {
         if bytes[i] != 0x1b || bytes[i + 1] != b']' {
@@ -226,6 +244,49 @@ pub fn extract_osc_command(text: &str) -> Option<(String, std::ops::Range<usize>
         i = end + term_len;
     }
     None
+}
+
+/// Return the length of the prefix containing only complete OSC sequences.
+///
+/// A trailing `ESC` or unterminated `ESC ] ...` is retained for the next SSH
+/// read, allowing OSC 7/697 control strings to be recognized across arbitrary
+/// network chunk boundaries.
+fn complete_osc_prefix_len(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if i + 1 == bytes.len() {
+            return i;
+        }
+        if bytes[i + 1] != b']' {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 2;
+        loop {
+            if end >= bytes.len() {
+                return i;
+            }
+            if bytes[end] == 0x07 {
+                i = end + 1;
+                break;
+            }
+            if bytes[end] == 0x1b {
+                if end + 1 >= bytes.len() {
+                    return i;
+                }
+                if bytes[end + 1] == b'\\' {
+                    i = end + 2;
+                    break;
+                }
+            }
+            end += 1;
+        }
+    }
+    bytes.len()
 }
 
 /// Percent-decode a URL path segment (e.g. `%20` → space).
@@ -347,8 +408,11 @@ pub struct ProcInfo {
 pub enum SessionEvent {
     /// Free-form status text for the tab header / status line.
     Status(String),
-    /// A chunk of stdout/stderr output from the remote shell.
-    Output(String),
+    /// A raw stdout/stderr chunk from the remote shell.
+    ///
+    /// Terminal protocols are byte streams. Keeping the bytes intact avoids a
+    /// lossy UTF-8 round-trip when a multibyte character is split across reads.
+    Output(Vec<u8>),
     /// Connection is up.
     Connected,
     /// Connection closed (either cleanly or after an error).
@@ -642,7 +706,10 @@ async fn run_session(
     let mut suppress_started: Option<std::time::Instant> = None;
     // Buffers output while `suppress_echo` so the (long) echoed setup line can be
     // stripped even when it splits across reads (#98).
-    let mut echo_buf = String::new();
+    let mut echo_buf = Vec::new();
+    // Tail beginning with an incomplete OSC control string. SSH reads may
+    // split anywhere, including between ESC and ']' or inside UTF-8 commands.
+    let mut osc_pending = Vec::new();
     // After a ZMODEM transfer finishes we briefly ignore ZMODEM detection so the
     // sender's lingering close frames can't spawn a spurious second receive (#76).
     let mut zmodem_done_at: Option<std::time::Instant> = None;
@@ -735,16 +802,22 @@ async fn run_session(
         };
         match handle.tcpip_forward(bind.clone(), f.bind_port as u32).await {
             Ok(_) => {
-                let _ = events.send(SessionEvent::Output(format!(
-                    "\r\n[cloudshell] -R {bind}:{} → {}:{}\r\n",
-                    f.bind_port, f.host, f.host_port
-                )));
+                let _ = events.send(SessionEvent::Output(
+                    format!(
+                        "\r\n[cloudshell] -R {bind}:{} → {}:{}\r\n",
+                        f.bind_port, f.host, f.host_port
+                    )
+                    .into_bytes(),
+                ));
             }
             Err(e) => {
-                let _ = events.send(SessionEvent::Output(format!(
-                    "\r\n[cloudshell] -R {bind}:{} 请求失败 / request failed: {e}\r\n",
-                    f.bind_port
-                )));
+                let _ = events.send(SessionEvent::Output(
+                    format!(
+                        "\r\n[cloudshell] -R {bind}:{} 请求失败 / request failed: {e}\r\n",
+                        f.bind_port
+                    )
+                    .into_bytes(),
+                ));
             }
         }
     }
@@ -810,9 +883,9 @@ async fn run_session(
                 if suppress_echo {
                     suppress_echo = false;
                     suppress_started = None;
-                    let text = strip_prompt_setup_echo(std::mem::take(&mut echo_buf));
-                    if !text.is_empty() {
-                        let _ = events.send(SessionEvent::Output(text));
+                    let bytes = strip_prompt_setup_echo(std::mem::take(&mut echo_buf));
+                    if !bytes.is_empty() {
+                        let _ = events.send(SessionEvent::Output(bytes));
                     }
                 }
             }
@@ -834,13 +907,13 @@ async fn run_session(
                                     // run them through the normal output path so
                                     // the prompt shows and the cwd updates.
                                     if !leftover.is_empty() {
-                                        let text =
-                                            String::from_utf8_lossy(&leftover).into_owned();
-                                        if let Some(cwd) = extract_osc7_path(&text) {
+                                        if let Some(cwd) = extract_osc7_end_bytes(&leftover)
+                                            .map(|(path, _)| path)
+                                        {
                                             let _ =
                                                 events.send(SessionEvent::CwdChanged(cwd));
                                         }
-                                        let _ = events.send(SessionEvent::Output(text));
+                                        let _ = events.send(SessionEvent::Output(leftover));
                                     }
                                 }
                                 Err(e) => {
@@ -849,18 +922,16 @@ async fn run_session(
                                     let _ = events.send(SessionEvent::Output(format!(
                                         "\r\n[cloudshell] {}: {e}\r\n",
                                         t("ZMODEM 接收失败,已取消", "ZMODEM receive failed; cancelled")
-                                    )));
+                                    ).into_bytes()));
                                 }
                             }
                             continue;
                         }
 
-                        let chunk = String::from_utf8_lossy(&data).into_owned();
-
                         // Inject PROMPT_COMMAND after the first real shell output.
                         let injected_prompt_hook = shell_integration
                             && !prompt_injected
-                            && !chunk.trim().is_empty();
+                            && !data.iter().all(u8::is_ascii_whitespace);
                         if injected_prompt_hook {
                             prompt_injected = true;
                             suppress_echo = true;
@@ -882,13 +953,13 @@ async fn run_session(
                         // short, un-wrappable prefix of the injected command. A size
                         // cap is the safety valve for a shell that never reports back
                         // (e.g. dash without PROMPT_COMMAND).
-                        let mut text = if suppress_echo && !injected_prompt_hook {
-                            echo_buf.push_str(&chunk);
+                        let bytes = if suppress_echo && !injected_prompt_hook {
+                            echo_buf.extend_from_slice(&data);
                             const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
                             // The command echo + its trailing OSC 7 (the one after
                             // our command, not any earlier prompt OSC 7).
-                            let landed = echo_buf.find(PROMPT_PREFIX).and_then(|p| {
-                                extract_osc7_end(&echo_buf[p..])
+                            let landed = find_bytes(&echo_buf, PROMPT_PREFIX.as_bytes()).and_then(|p| {
+                                extract_osc7_end_bytes(&echo_buf[p..])
                                     .map(|(cwd, rel)| (p, p + rel, cwd))
                             });
                             if let Some((cmd_pos, osc_end, cwd)) = landed {
@@ -898,10 +969,11 @@ async fn run_session(
                                 let _ = events.send(SessionEvent::CwdChanged(cwd));
                                 let mut buf = std::mem::take(&mut echo_buf);
                                 let line_start = buf[..cmd_pos]
-                                    .rfind(['\r', '\n'])
+                                    .iter()
+                                    .rposition(|byte| matches!(byte, b'\r' | b'\n'))
                                     .map(|i| i + 1)
                                     .unwrap_or(0);
-                                buf.replace_range(line_start..osc_end, "");
+                                buf.drain(line_start..osc_end);
                                 buf
                             } else if echo_buf.len() >= ECHO_BUF_CAP
                                 || suppress_started.is_some_and(|started| started.elapsed() >= std::time::Duration::from_millis(1200)) {
@@ -912,20 +984,39 @@ async fn run_session(
                                 continue; // keep buffering; show nothing yet
                             }
                         } else {
-                            // Scan for the OSC 7 CWD notification (cd-follow).
-                            if let Some(cwd) = extract_osc7_path(&chunk) {
-                                tracing::debug!("OSC7 cwd={:?}", cwd);
-                                let _ = events.send(SessionEvent::CwdChanged(cwd));
-                            }
-                            chunk
+                            data.to_vec()
                         };
+
+                        // Hold only an incomplete trailing OSC sequence. Plain
+                        // output remains streaming, while OSC parsing becomes
+                        // independent of SSH packet boundaries.
+                        osc_pending.extend_from_slice(&bytes);
+                        const OSC_PENDING_CAP: usize = 1 << 16;
+                        let complete_len = complete_osc_prefix_len(&osc_pending);
+                        let mut bytes = if complete_len == 0
+                            && osc_pending.len() >= OSC_PENDING_CAP
+                        {
+                            // Malformed/unbounded OSC: pass it through rather
+                            // than allowing a remote peer to grow memory forever.
+                            std::mem::take(&mut osc_pending)
+                        } else {
+                            osc_pending.drain(..complete_len).collect::<Vec<_>>()
+                        };
+
+                        // Scan every completed OSC 7 CWD notification.
+                        let mut cwd_scan = 0usize;
+                        while let Some((cwd, end)) = extract_osc7_end_bytes(&bytes[cwd_scan..]) {
+                            tracing::debug!("OSC7 cwd={:?}", cwd);
+                            let _ = events.send(SessionEvent::CwdChanged(cwd));
+                            cwd_scan += end;
+                        }
 
                         // Capture commands run in the terminal via our OSC 697
                         // hook, and strip the sequence so it never reaches the
                         // renderer (#113). Skip our own injected setup line in the
                         // rare case HISTCONTROL=ignorespace isn't in effect.
-                        while let Some((cmd, range)) = extract_osc_command(&text) {
-                            text.replace_range(range, "");
+                        while let Some((cmd, range)) = extract_osc_command_bytes(&bytes) {
+                            bytes.drain(range);
                             let cmd = cmd.trim();
                             if !cmd.is_empty() && !cmd.contains("__ms7") {
                                 let _ = events.send(SessionEvent::CommandRan(cmd.to_string()));
@@ -933,13 +1024,14 @@ async fn run_session(
                         }
                         // Safety net for a hook echo split at a PTY read or
                         // terminal-wrap boundary after suppression has ended.
-                        text = strip_prompt_setup_echo(text);
+                        bytes = strip_prompt_setup_echo(bytes);
 
-                        let _ = events.send(SessionEvent::Output(text));
+                        if !bytes.is_empty() {
+                            let _ = events.send(SessionEvent::Output(bytes));
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
-                        let _ = events.send(SessionEvent::Output(text));
+                        let _ = events.send(SessionEvent::Output(data.to_vec()));
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         let _ = events.send(SessionEvent::Status(
@@ -996,6 +1088,10 @@ async fn run_session(
                 }
             }
         }
+    }
+
+    if !osc_pending.is_empty() {
+        let _ = events.send(SessionEvent::Output(osc_pending));
     }
 
     // Tear down any port-forward listeners (#56); -R forwards die with the
@@ -1427,15 +1523,6 @@ impl Handler for ClientHandler {
         Ok(verify_host_key(&self.host, self.port, server_public_key, &self.events).await)
     }
 
-    async fn data(
-        &mut self,
-        _channel: ChannelId,
-        _data: &[u8],
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
     /// Remote forward (-R): the server opened a channel for a connection that
     /// arrived on a port we asked it to listen on. Connect to the configured
     /// local target and splice the two together (#56).
@@ -1462,12 +1549,24 @@ impl Handler for ClientHandler {
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
                 }
                 Err(e) => {
-                    let _ = events.send(SessionEvent::Output(format!(
-                        "\r\n[cloudshell] -R {host}:{port} 连接失败 / connect failed: {e}\r\n"
-                    )));
+                    let _ = events.send(SessionEvent::Output(
+                        format!(
+                            "\r\n[cloudshell] -R {host}:{port} 连接失败 / connect failed: {e}\r\n"
+                        )
+                        .into_bytes(),
+                    ));
                 }
             }
         });
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        _data: &[u8],
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -1481,7 +1580,10 @@ fn _assert_handle_send() {
 
 #[cfg(test)]
 mod osc_command_tests {
-    use super::{extract_osc_command, strip_prompt_setup_echo};
+    use super::{
+        complete_osc_prefix_len, extract_osc7_path, extract_osc_command, extract_osc_command_bytes,
+        strip_prompt_setup_echo,
+    };
 
     #[test]
     fn extracts_and_locates_bel_terminated() {
@@ -1511,24 +1613,51 @@ mod osc_command_tests {
     }
 
     #[test]
+    fn osc_sequences_can_span_network_chunks() {
+        let mut pending = b"plain\x1b]697;echo ".to_vec();
+        pending.extend_from_slice(&"你好".as_bytes()[..2]);
+        assert_eq!(complete_osc_prefix_len(&pending), 5);
+
+        pending.extend_from_slice(&"你好".as_bytes()[2..]);
+        pending.push(0x07);
+        assert_eq!(complete_osc_prefix_len(&pending), pending.len());
+        let (command, _) = extract_osc_command_bytes(&pending).expect("completed command");
+        assert_eq!(command, "echo 你好");
+    }
+
+    #[test]
+    fn extracts_osc7_path_from_utf8_text() {
+        assert_eq!(
+            extract_osc7_path("\u{1b}]7;file://host/home/dao/My%20Files\u{07}"),
+            Some("/home/dao/My Files".to_string())
+        );
+    }
+
+    #[test]
     fn timeout_fallback_removes_a_complete_hook_echo() {
         let text = "banner\r\n test -z \"$FISH_VERSION\" && eval ...\r\nprompt> ";
-        assert_eq!(strip_prompt_setup_echo(text.into()), "banner\r\nprompt> ");
+        assert_eq!(
+            strip_prompt_setup_echo(text.as_bytes().to_vec()),
+            b"banner\r\nprompt> "
+        );
     }
 
     #[test]
     fn timeout_fallback_removes_cr_terminated_hook_echo() {
         let text = "banner\rtest -z \"$FISH_VERSION\" && eval ...\rroot@host:~# ";
         assert_eq!(
-            strip_prompt_setup_echo(text.into()),
-            "banner\rroot@host:~# "
+            strip_prompt_setup_echo(text.as_bytes().to_vec()),
+            b"banner\rroot@host:~# "
         );
     }
 
     #[test]
     fn removes_wrapped_hook_tail_without_the_prefix() {
         let text = "<__ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; __ms7'\rroot@host:~# ";
-        assert_eq!(strip_prompt_setup_echo(text.into()), "root@host:~# ");
+        assert_eq!(
+            strip_prompt_setup_echo(text.as_bytes().to_vec()),
+            b"root@host:~# "
+        );
     }
 }
 
