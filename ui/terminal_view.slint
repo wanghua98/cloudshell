@@ -88,6 +88,7 @@ export component TerminalView inherits Rectangle {
     in property <bool> is-macos: false;
     in property <string> cursor-style: "block";
     in property <color> cursor-color: Theme.term-fg;
+    in-out property <bool> scroll-hovered: false;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
     in property <int> cursor-row;       // cursor cell (grid coords)
@@ -379,6 +380,7 @@ export component TerminalView inherits Rectangle {
                         // also pastes, matching the bottom strip.
                         body-touch := TouchArea {
                             mouse-cursor: text;
+                            changed has-hover => { root.scroll-hovered = self.has-hover; }
                             pointer-event(ev) => {
                                 if (ev.kind == PointerEventKind.down) {
                                     // Any button press re-takes keyboard focus.

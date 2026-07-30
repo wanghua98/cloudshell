@@ -877,6 +877,11 @@ pub fn run() -> Result<()> {
                     };
                     if dy == 0.0 { return EventResult::Propagate; }
                     if let Some(win) = weak.upgrade() {
+                        // Let SFTP lists, dialogs and every other UI region
+                        // receive their native Slint wheel event unchanged.
+                        if !win.get_terminal_scroll_hover() {
+                            return EventResult::Propagate;
+                        }
                         let tid = win.get_active_tab_id().to_string();
                         let alt = wheel_bufs.lock().unwrap().get(&tid)
                             .is_some_and(|b| b.parser.screen().alternate_screen());
