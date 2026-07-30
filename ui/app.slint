@@ -1163,7 +1163,7 @@ export component AppWindow inherits Window {
     }
     // Always present; toggled via `visible` (avoids destroying interactive
     // elements mid-event, which crashes when created/removed at the Window root).
-    if root.settings-open : Rectangle {
+    if root.download-open : Rectangle {
         x: parent.width - 364px;
         y: root.custom-titlebar ? 78px : 40px;
         width: 350px;
