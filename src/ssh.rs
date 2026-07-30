@@ -989,7 +989,11 @@ async fn connect_ssh(
     events: &UnboundedSender<SessionEvent>,
 ) -> Result<Handle<ClientHandler>> {
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(60 * 10)),
+        // Keep an otherwise idle terminal alive through NAT/firewall state
+        // expiry. This also matters when shell integration (and its monitor
+        // channel) is disabled for Windows or appliance shells.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 3,
         ..<_>::default()
     });
     let remote_forwards = session

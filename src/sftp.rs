@@ -235,7 +235,10 @@ async fn run_sftp(
 
     // Open a dedicated SSH connection for SFTP.
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(60 * 30)),
+        // SFTP can sit idle with no terminal-like traffic, so actively keep
+        // this separate SSH transport alive through NATs and idle sshd rules.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 3,
         ..<_>::default()
     });
 
