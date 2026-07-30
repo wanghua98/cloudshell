@@ -104,7 +104,13 @@ export component LabeledInput inherits VerticalLayout {
     in property <string> placeholder;
     in-out property <string> value;
     in property <bool> password: false;
+    in property <bool> auto-focus: false;
+    callback canceled();
     spacing: 4px;
+
+    changed auto-focus => {
+        if (root.auto-focus) { input.focus(); }
+    }
 
     Text {
         text: label;
@@ -134,6 +140,12 @@ export component LabeledInput inherits VerticalLayout {
             vertical-alignment: center;
             single-line: true;
             input-type: root.password ? InputType.password : InputType.text;
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.canceled();
+                    accept
+                } else { reject }
+            }
         }
 
         // Lightweight placeholder — shown when value is empty.

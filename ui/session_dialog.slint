@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
+import { CheckBox } from "std-widgets.slint";
 
 // One SSH port-forward row shown in the session dialog (#56). `summary` is a
 // ready-to-display line like "-L 127.0.0.1:8080 → host:80".
@@ -28,6 +29,7 @@ export struct SessionDraft {
     stop-bits: int,
     parity: string,        // "none" | "odd" | "even"
     flow-control: string,  // "none" | "hardware" | "software"
+    disable-shell-integration: bool,
 }
 
 // A single segment in a segmented selector (auth toggle, baud presets, …).
@@ -111,6 +113,7 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-stop-bits: "1";
     in-out property <string> draft-parity: "none";
     in-out property <string> draft-flow: "none";
+    in-out property <bool> draft-disable-shell-integration: false;
 
     // Port forwards / tunnels (#56). `forwards` is the current list (fed from
     // Rust); the nf-* properties hold the add-form fields.
@@ -431,6 +434,10 @@ export component SessionDialog inherits Rectangle {
             // ── Optional outbound proxy (SSH / Telnet only) ─────────────────
             if root.show-advanced && root.draft-kind != "serial" : VerticalLayout {
                 spacing: 4px;
+                if root.draft-kind == "ssh" : CheckBox {
+                    text: @tr("Disable shell integration (Windows / restricted shells)");
+                    checked <=> root.draft-disable-shell-integration;
+                }
                 Text {
                     text: @tr("Proxy (optional)");
                     color: Theme.text-secondary;
@@ -586,6 +593,7 @@ export component SessionDialog inherits Rectangle {
                             stop-bits: root.draft-stop-bits.to-float(),
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
+                            disable-shell-integration: root.draft-disable-shell-integration,
                         });
                     }
                 }

@@ -203,6 +203,10 @@ pub struct Session {
     /// Tunnels established automatically when this SSH session connects.
     #[serde(default)]
     pub forwards: Vec<PortForward>,
+    /// Disable POSIX prompt hooks and remote `/proc` monitoring. Useful for
+    /// Windows shells (pwsh/cmd) and restricted appliance consoles.
+    #[serde(default)]
+    pub disable_shell_integration: bool,
 }
 
 /// One SSH tunnel (#56). `kind` is "local" (-L), "remote" (-R) or
@@ -247,6 +251,7 @@ impl Session {
             parity: default_parity(),
             flow_control: default_flow(),
             forwards: Vec::new(),
+            disable_shell_integration: false,
         }
     }
 }

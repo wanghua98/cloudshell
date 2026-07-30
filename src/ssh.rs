@@ -79,6 +79,21 @@ const ZMODEM_CANCEL: [u8; 16] = [
     0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
 ];
 
+const PROMPT_PREFIX: &str = "test -z \"$FISH_VERSION\"";
+
+/// Remove a complete echoed POSIX integration line, if the server returned one.
+/// In particular, this keeps the timeout fallback safe for pwsh/cmd, which
+/// never produces the OSC 7 marker used by the normal path.
+fn strip_prompt_setup_echo(mut text: String) -> String {
+    if let Some(pos) = text.find(PROMPT_PREFIX) {
+        let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if let Some(end) = text[pos..].find('\n') {
+            text.replace_range(start..pos + end + 1, "");
+        }
+    }
+    text
+}
+
 /// Detect the start of a ZMODEM transfer (sz/rz) in a raw channel chunk.
 ///
 /// Every ZMODEM frame begins with ZDLE (0x18) followed by a type byte; the
@@ -594,9 +609,11 @@ async fn run_session(
     // We wait for the first non-empty data chunk (the initial shell prompt)
     // before sending so the command doesn't interleave with banner text.
     let mut prompt_injected = false;
+    let shell_integration = !session.disable_shell_integration;
     // True from injecting PROMPT_SETUP until the echoed setup line has been
     // received and stripped; output is buffered (not shown) during that window.
     let mut suppress_echo = false;
+    let mut suppress_started: Option<std::time::Instant> = None;
     // Buffers output while `suppress_echo` so the (long) echoed setup line can be
     // stripped even when it splits across reads (#98).
     let mut echo_buf = String::new();
@@ -656,18 +673,22 @@ async fn run_session(
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
     const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; sleep 2; done\n";
-    let mut mon_channel = match handle.channel_open_session().await {
-        Ok(ch) => match ch.exec(true, MON_CMD).await {
-            Ok(()) => Some(ch),
+    let mut mon_channel = if shell_integration {
+        match handle.channel_open_session().await {
+            Ok(ch) => match ch.exec(true, MON_CMD).await {
+                Ok(()) => Some(ch),
+                Err(e) => {
+                    tracing::warn!("monitor exec failed: {e}");
+                    None
+                }
+            },
             Err(e) => {
-                tracing::warn!("monitor exec failed: {e}");
+                tracing::warn!("monitor channel open failed: {e}");
                 None
             }
-        },
-        Err(e) => {
-            tracing::warn!("monitor channel open failed: {e}");
-            None
         }
+    } else {
+        None
     };
     let mut mon_buf = String::new();
     let mut prev_cpu: Option<(u64, u64)> = None; // (total jiffies, idle jiffies)
@@ -748,6 +769,27 @@ async fn run_session(
                     }
                 }
             }
+            // A Windows / restricted shell may accept the injected bytes but
+            // never echo the POSIX hook nor emit OSC 7. Do not wait for a
+            // further channel read to release the first prompt.
+            _ = async {
+                match suppress_started {
+                    Some(started) => tokio::time::sleep_until(
+                        tokio::time::Instant::from_std(started)
+                            + std::time::Duration::from_millis(1200),
+                    ).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if suppress_echo {
+                    suppress_echo = false;
+                    suppress_started = None;
+                    let text = strip_prompt_setup_echo(std::mem::take(&mut echo_buf));
+                    if !text.is_empty() {
+                        let _ = events.send(SessionEvent::Output(text));
+                    }
+                }
+            }
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
@@ -790,9 +832,10 @@ async fn run_session(
                         let chunk = String::from_utf8_lossy(&data).into_owned();
 
                         // Inject PROMPT_COMMAND after the first real shell output.
-                        if !prompt_injected && !chunk.trim().is_empty() {
+                        if shell_integration && !prompt_injected && !chunk.trim().is_empty() {
                             prompt_injected = true;
                             suppress_echo = true;
+                            suppress_started = Some(std::time::Instant::now());
                             let _ = channel.data(prompt_setup.as_bytes()).await;
                             // Fall through: this chunk is buffered below so the
                             // echoed setup line is stripped as a single piece.
@@ -809,7 +852,6 @@ async fn run_session(
                         // short, un-wrappable prefix of the injected command. A size
                         // cap is the safety valve for a shell that never reports back
                         // (e.g. dash without PROMPT_COMMAND).
-                        const PROMPT_PREFIX: &str = "test -z \"$FISH_VERSION\"";
                         let mut text = if suppress_echo {
                             echo_buf.push_str(&chunk);
                             const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
@@ -821,6 +863,7 @@ async fn run_session(
                             });
                             if let Some((cmd_pos, osc_end, cwd)) = landed {
                                 suppress_echo = false;
+                                suppress_started = None;
                                 tracing::debug!("OSC7 cwd={:?}", cwd);
                                 let _ = events.send(SessionEvent::CwdChanged(cwd));
                                 let mut buf = std::mem::take(&mut echo_buf);
@@ -828,9 +871,11 @@ async fn run_session(
                                     buf[..cmd_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
                                 buf.replace_range(line_start..osc_end, "");
                                 buf
-                            } else if echo_buf.len() >= ECHO_BUF_CAP {
+                            } else if echo_buf.len() >= ECHO_BUF_CAP
+                                || suppress_started.is_some_and(|started| started.elapsed() >= std::time::Duration::from_millis(1200)) {
                                 suppress_echo = false;
-                                std::mem::take(&mut echo_buf)
+                                suppress_started = None;
+                                strip_prompt_setup_echo(std::mem::take(&mut echo_buf))
                             } else {
                                 continue; // keep buffering; show nothing yet
                             }
@@ -1397,7 +1442,7 @@ fn _assert_handle_send() {
 
 #[cfg(test)]
 mod osc_command_tests {
-    use super::extract_osc_command;
+    use super::{extract_osc_command, strip_prompt_setup_echo};
 
     #[test]
     fn extracts_and_locates_bel_terminated() {
@@ -1424,6 +1469,12 @@ mod osc_command_tests {
         // No terminator yet → wait for more.
         assert!(extract_osc_command("\u{1b}]697;ls").is_none());
         assert!(extract_osc_command("plain text").is_none());
+    }
+
+    #[test]
+    fn timeout_fallback_removes_a_complete_hook_echo() {
+        let text = "banner\r\n test -z \"$FISH_VERSION\" && eval ...\r\nprompt> ";
+        assert_eq!(strip_prompt_setup_echo(text.into()), "banner\r\nprompt> ");
     }
 }
 

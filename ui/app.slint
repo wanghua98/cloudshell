@@ -428,6 +428,7 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-stop-bits: "1";
     in-out property <string> dialog-parity: "none";
     in-out property <string> dialog-flow: "none";
+    in-out property <bool> dialog-disable-shell-integration: false;
 
     // Delete-confirmation modal state (#28).
     in-out property <bool> confirm-delete-open: false;
@@ -1152,7 +1153,7 @@ export component AppWindow inherits Window {
     }
     // Always present; toggled via `visible` (avoids destroying interactive
     // elements mid-event, which crashes when created/removed at the Window root).
-    Rectangle {
+    if root.settings-open : Rectangle {
         x: parent.width - 364px;
         y: root.custom-titlebar ? 78px : 40px;
         width: 350px;
@@ -1473,12 +1474,11 @@ export component AppWindow inherits Window {
         height: parent.height;
         clicked => { root.settings-open = false; }
     }
-    Rectangle {
+    if root.settings-open : Rectangle {
         x: parent.width - 196px;
         y: root.custom-titlebar ? 78px : 40px;
         width: 198px;
         height: root.ssh-import-hint == "" ? 220px : 244px;
-        visible: root.settings-open;
         background: Theme.bg-panel;
         border-radius: Theme.radius-md;
         border-width: 1px;
@@ -1487,6 +1487,14 @@ export component AppWindow inherits Window {
         drop-shadow-color: #00000060;
 
         TouchArea {}   // swallow events so they don't reach the terminal
+        settings-key-capture := TextInput {
+            x: 0; y: 0; width: 1px; height: 1px; opacity: 0;
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) { root.settings-open = false; }
+                accept
+            }
+        }
 
         VerticalLayout {
             padding: 4px;
@@ -2158,6 +2166,18 @@ export component AppWindow inherits Window {
         height: parent.height;
         background: #00000088;
         TouchArea { clicked => { root.confirm-close-open = false; } }
+        close-key-capture := TextInput {
+            x: 0; y: 0; width: 1px; height: 1px; opacity: 0;
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.confirm-close-open = false;
+                } else if (event.text == Key.Return || event.text == " ") {
+                    root.confirm-close-yes();
+                }
+                accept
+            }
+        }
 
         Rectangle {
             x: (parent.width - self.width) / 2;
@@ -2688,18 +2708,25 @@ export component AppWindow inherits Window {
     }
 
     // --- Keyboard shortcuts dialog (#103) ---------------------------------
-    Rectangle {
+    if root.shortcuts-open : Rectangle {
         width: parent.width;
         height: parent.height;
-        visible: root.shortcuts-open;
         background: #00000080;
         TouchArea { clicked => { root.shortcuts-open = false; } }
+        shortcuts-key-capture := TextInput {
+            x: 0; y: 0; width: 1px; height: 1px; opacity: 0;
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) { root.shortcuts-open = false; }
+                accept
+            }
+        }
 
         Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 424px;
-            height: 432px;
+            height: min(520px, parent.height - 40px);
             background: Theme.bg-panel;
             border-radius: Theme.radius-md;
             border-width: 1px;
@@ -2735,24 +2762,31 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Text { text: root.lang-en ? "Terminal" : "终端";
-                       color: Theme.text-muted; font-size: Theme.fs-xs; }
-                ShortcutRow { keys: "Ctrl+Shift+C"; desc: root.lang-en ? "Copy selection" : "复制选中内容"; }
-                ShortcutRow { keys: "Ctrl+V"; desc: root.lang-en ? "Paste" : "粘贴"; }
-                ShortcutRow { keys: root.lang-en ? "Drag" : "鼠标拖动"; desc: root.lang-en ? "Select text" : "选择文本"; }
-                ShortcutRow { keys: root.lang-en ? "Wheel / Scrollbar" : "滚轮 / 滚动条"; desc: root.lang-en ? "Scroll history" : "滚动历史"; }
-
-                Rectangle { height: 6px; }
-                Text { text: root.lang-en ? "Command box" : "命令输入框";
-                       color: Theme.text-muted; font-size: Theme.fs-xs; }
-                ShortcutRow { keys: "Enter"; desc: root.lang-en ? "Send command" : "发送命令"; }
-                ShortcutRow { keys: "↑ / ↓"; desc: root.lang-en ? "Previous / next in history" : "上一条 / 下一条历史"; }
-                ShortcutRow { keys: "Ctrl+A"; desc: root.lang-en ? "Move to start of line" : "移到行首"; }
-                ShortcutRow { keys: "Ctrl+E"; desc: root.lang-en ? "Move to end of line" : "移到行尾"; }
-                ShortcutRow { keys: "Ctrl+K"; desc: root.lang-en ? "Delete to end of line" : "删除到行尾"; }
-                ShortcutRow { keys: "Ctrl+U"; desc: root.lang-en ? "Delete to start of line" : "删除到行首"; }
-
-                Rectangle { vertical-stretch: 1; }
+                Flickable {
+                    vertical-stretch: 1;
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, shortcuts-content.preferred-height);
+                    shortcuts-content := VerticalLayout {
+                        spacing: 5px;
+                        Text { text: root.lang-en ? "Terminal" : "终端";
+                               color: Theme.text-muted; font-size: Theme.fs-xs; }
+                        ShortcutRow { keys: "Ctrl+Shift+C"; desc: root.lang-en ? "Copy selection" : "复制选中内容"; }
+                        ShortcutRow { keys: "Ctrl+V"; desc: root.lang-en ? "Paste" : "粘贴"; }
+                        ShortcutRow { keys: "Ctrl+Shift+R"; desc: root.lang-en ? "Search command history" : "检索命令历史"; }
+                        ShortcutRow { keys: root.lang-en ? "Drag" : "鼠标拖动"; desc: root.lang-en ? "Select text" : "选择文本"; }
+                        ShortcutRow { keys: root.lang-en ? "Wheel / Scrollbar" : "滚轮 / 滚动条"; desc: root.lang-en ? "Scroll history" : "滚动历史"; }
+                        Rectangle { height: 6px; }
+                        Text { text: root.lang-en ? "Command box" : "命令输入框";
+                               color: Theme.text-muted; font-size: Theme.fs-xs; }
+                        ShortcutRow { keys: "Enter"; desc: root.lang-en ? "Send command" : "发送命令"; }
+                        ShortcutRow { keys: "Ctrl+R"; desc: root.lang-en ? "Search command history" : "检索命令历史"; }
+                        ShortcutRow { keys: "↑ / ↓"; desc: root.lang-en ? "Previous / next in history" : "上一条 / 下一条历史"; }
+                        ShortcutRow { keys: "Ctrl+A"; desc: root.lang-en ? "Move to start of line" : "移到行首"; }
+                        ShortcutRow { keys: "Ctrl+E"; desc: root.lang-en ? "Move to end of line" : "移到行尾"; }
+                        ShortcutRow { keys: "Ctrl+K"; desc: root.lang-en ? "Delete to end of line" : "删除到行尾"; }
+                        ShortcutRow { keys: "Ctrl+U"; desc: root.lang-en ? "Delete to start of line" : "删除到行首"; }
+                    }
+                }
             }
         }
     }
@@ -2871,6 +2905,7 @@ export component AppWindow inherits Window {
         draft-stop-bits <=> root.dialog-stop-bits;
         draft-parity <=> root.dialog-parity;
         draft-flow <=> root.dialog-flow;
+        draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
         forwards: root.dialog-forwards;
         submit(draft) => { root.session-dialog-submit(draft); }
         cancel => { root.session-dialog-cancel(); }
@@ -2954,12 +2989,16 @@ export component AppWindow inherits Window {
                     label: @tr("Username");
                     placeholder: "root";
                     value <=> root.cred-user;
+                    auto-focus: !root.cred-need-password;
+                    canceled => { root.cred-reject(); }
                 }
                 if root.cred-need-password : LabeledInput {
                     label: @tr("Password");
                     placeholder: "••••••••";
                     password: true;
                     value <=> root.cred-password;
+                    auto-focus: true;
+                    canceled => { root.cred-reject(); }
                 }
                 CheckBox {
                     text: @tr("Remember for this session");

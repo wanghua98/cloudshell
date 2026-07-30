@@ -117,6 +117,7 @@ export component TerminalView inherits Rectangle {
     property <bool> quick-open: false;         // quick-command popup visibility
     property <bool> history-open: false;       // history dropdown visibility
     property <int> history-cursor: -1;         // ↑/↓ recall index (-1 = live input)
+    property <int> history-selection: -1;      // keyboard selection in filtered history
     callback run-command(string /* cmd */, bool /* to-all */);
     callback manage-quick-commands();          // open the add/edit/delete dialog
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
@@ -261,7 +262,10 @@ export component TerminalView inherits Rectangle {
     // Reset the history filter whenever the dropdown opens; the search box itself
     // is recreated empty because the `if` subtree is destroyed on close (#101).
     changed history-open => {
-        if (root.history-open) { root.search-history(""); }
+        if (root.history-open) {
+            root.history-selection = -1;
+            root.search-history("");
+        }
     }
     changed visible => {
         if (self.visible) {
@@ -599,6 +603,15 @@ export component TerminalView inherits Rectangle {
                         // Restore focus explicitly so the cursor keeps blinking.
                         ime-input.focus();
                         accept
+                    // Ctrl+Shift+R opens the command-history search. Plain
+                    // Ctrl+R is deliberately left for the remote shell's own
+                    // reverse search.
+                    } else if (event.modifiers.control && event.modifiers.shift
+                            && (event.text == "r" || event.text == "R"
+                                || event.text == "\u{0012}")) {
+                        root.quick-open = false;
+                        root.history-open = true;
+                        accept
                     // ── All other keys (printable, Ctrl+X, arrows, …) ────────
                     // Return `accept` for everything: `reject` bubbles without
                     // inserting the char into TextInput, so `edited` never fires
@@ -790,7 +803,11 @@ export component TerminalView inherits Rectangle {
                             root.history-cursor = -1;
                         }
                         key-pressed(e) => {
-                            if (e.text == Key.UpArrow) {
+                            if (e.modifiers.control && (e.text == "r" || e.text == "R" || e.text == "\u{0012}")) {
+                                root.quick-open = false;
+                                root.history-open = true;
+                                accept
+                            } else if (e.text == Key.UpArrow) {
                                 // Model is oldest→newest (#113): first ↑ jumps to
                                 // the newest (last), further ↑ steps toward older.
                                 if (root.command-history.length > 0) {
@@ -1126,7 +1143,38 @@ export component TerminalView inherits Rectangle {
                                     font-family: Theme.ui-font-family;
                                     font-size: Theme.fs-sm;
                                     single-line: true;
-                                    edited => { root.search-history(self.text); }
+                                    init => { self.focus(); }
+                                    edited => {
+                                        root.history-selection = -1;
+                                        root.search-history(self.text);
+                                    }
+                                    key-pressed(e) => {
+                                        if (e.text == Key.UpArrow) {
+                                            if (root.history-view.length > 0) {
+                                                root.history-selection = root.history-selection <= 0
+                                                    ? root.history-view.length - 1
+                                                    : root.history-selection - 1;
+                                            }
+                                            accept
+                                        } else if (e.text == Key.DownArrow) {
+                                            if (root.history-view.length > 0) {
+                                                root.history-selection = root.history-selection < 0
+                                                    || root.history-selection >= root.history-view.length - 1
+                                                    ? 0 : root.history-selection + 1;
+                                            }
+                                            accept
+                                        } else if (e.text == Key.Return && root.history-selection >= 0
+                                                && root.history-selection < root.history-view.length) {
+                                            root.run-command(root.history-view[root.history-selection], root.send-to-all);
+                                            root.history-open = false;
+                                            ime-input.focus();
+                                            accept
+                                        } else if (e.text == Key.Escape) {
+                                            root.history-open = false;
+                                            ime-input.focus();
+                                            accept
+                                        } else { reject }
+                                    }
                                 }
                                 if hist-search.text == "" : Text {
                                     text: @tr("Search history");
@@ -1148,10 +1196,10 @@ export component TerminalView inherits Rectangle {
                             horizontal-alignment: center;
                             height: 32px; vertical-alignment: center;
                         }
-                        for h in root.history-view : Rectangle {
+                        for h[i] in root.history-view : Rectangle {
                             height: 28px;
                             border-radius: Theme.radius-sm;
-                            background: h-item-ta.has-hover ? Theme.bg-hover : transparent;
+                            background: root.history-selection == i || h-item-ta.has-hover ? Theme.bg-hover : transparent;
                             // Row body click recalls the command into the input box.
                             h-item-ta := TouchArea {
                                 mouse-cursor: pointer;
