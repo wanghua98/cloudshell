@@ -277,6 +277,8 @@ export component AppWindow inherits Window {
     in property <[TransferInfo]> transfers; // download/upload records (newest first)
     in property <[string]> about-libs;      // open-source libraries used
     in-out property <bool> lang-en: false;  // current UI language (false = 中文)
+    // Slint maps macOS ⌘ to `control` and physical Ctrl to `meta`.
+    in property <bool> is-macos: false;
     // Two-way binding to Theme.dark — Rust reads/writes this property and
     // Slint propagates it to every widget that references Theme colours.
     in-out property <bool> dark-mode <=> Theme.dark;
@@ -693,6 +695,7 @@ export component AppWindow inherits Window {
                     width: term.id == root.active-tab-id ? parent.width : 0px;
                     height: term.id == root.active-tab-id ? parent.height : 0px;
                     tab-id: term.id;
+                    is-macos: root.is-macos;
                     status-line: term.status;
                     spans: term.spans;
                     cursor-row: term.cursor-row;
@@ -955,10 +958,10 @@ export component AppWindow inherits Window {
             scroll-event(event) => { accept }
         }
         edit-fs := FocusScope {
-            // Ctrl+S saves, Esc closes. These bubble up from the focused
+            // Ctrl+S / ⌘S saves, Esc closes. These bubble up from the focused
             // TextInput because it doesn't consume them.
             key-pressed(e) => {
-                if (e.text == "s" && e.modifiers.control) {
+                if (e.modifiers.control && (e.text == "s" || e.text == "S" || e.text == "\u{0013}")) {
                     root.save-file();
                     return accept;
                 }

@@ -206,6 +206,7 @@ pub fn run() -> Result<()> {
     // its native decorations, so turn the custom bar off there.
     #[cfg(target_os = "macos")]
     window.set_custom_titlebar(false);
+    window.set_is_macos(cfg!(target_os = "macos"));
 
     // Apply the saved UI language.  The Rust-side flag drives `i18n::t(...)`;
     // `apply_to_slint` selects the bundled `.po` for the static `@tr(...)` text

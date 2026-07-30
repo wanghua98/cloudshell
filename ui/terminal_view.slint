@@ -85,6 +85,7 @@ component MenuItem inherits Rectangle {
 
 export component TerminalView inherits Rectangle {
     in property <string> tab-id;
+    in property <bool> is-macos: false;
     in property <string> status-line: @tr("Not connected");
     in property <[TermSpan]> spans;     // coloured runs of the visible screen
     in property <int> cursor-row;       // cursor cell (grid coords)
@@ -612,12 +613,17 @@ export component TerminalView inherits Rectangle {
                         root.quick-open = false;
                         root.history-open = true;
                         accept
+                    // On macOS `control` is ⌘. App shortcuts above are handled
+                    // locally; swallow any other ⌘ combination rather than
+                    // sending its C0 text to the remote shell.
+                    } else if (root.is-macos && event.modifiers.control) {
+                        accept
                     // ── All other keys (printable, Ctrl+X, arrows, …) ────────
                     // Return `accept` for everything: `reject` bubbles without
                     // inserting the char into TextInput, so `edited` never fires
                     // for regular keystrokes — the character would be lost.
                     } else {
-                        root.send-key(event.text, event.modifiers.control,
+                        root.send-key(event.text, root.is-macos ? event.modifiers.meta : event.modifiers.control,
                                       event.modifiers.alt, event.modifiers.shift);
                         accept
                     }
@@ -803,7 +809,8 @@ export component TerminalView inherits Rectangle {
                             root.history-cursor = -1;
                         }
                         key-pressed(e) => {
-                            if (e.modifiers.control && (e.text == "r" || e.text == "R" || e.text == "\u{0012}")) {
+                            if (((root.is-macos && e.modifiers.meta) || (!root.is-macos && e.modifiers.control))
+                                    && (e.text == "r" || e.text == "R" || e.text == "\u{0012}")) {
                                 root.quick-open = false;
                                 root.history-open = true;
                                 accept
@@ -831,20 +838,24 @@ export component TerminalView inherits Rectangle {
                                 accept
                             // --- readline line-editing keys (#103) ---
                             // Ctrl+A → start of line.
-                            } else if (e.modifiers.control && (e.text == "a" || e.text == "A" || e.text == "\u{0001}")) {
+                            } else if (((root.is-macos && e.modifiers.meta) || (!root.is-macos && e.modifiers.control))
+                                    && (e.text == "a" || e.text == "A" || e.text == "\u{0001}")) {
                                 self.set-selection-offsets(0, 0);
                                 accept
                             // Ctrl+E → end of line.
-                            } else if (e.modifiers.control && (e.text == "e" || e.text == "E" || e.text == "\u{0005}")) {
+                            } else if (((root.is-macos && e.modifiers.meta) || (!root.is-macos && e.modifiers.control))
+                                    && (e.text == "e" || e.text == "E" || e.text == "\u{0005}")) {
                                 self.set-selection-offsets(1000000, 1000000);
                                 accept
                             // Ctrl+K → kill from cursor to end (deletes + clipboard).
-                            } else if (e.modifiers.control && (e.text == "k" || e.text == "K" || e.text == "\u{000B}")) {
+                            } else if (((root.is-macos && e.modifiers.meta) || (!root.is-macos && e.modifiers.control))
+                                    && (e.text == "k" || e.text == "K" || e.text == "\u{000B}")) {
                                 self.set-selection-offsets(self.cursor-position_byte-offset, 1000000);
                                 self.cut();
                                 accept
                             // Ctrl+U → kill from start to cursor.
-                            } else if (e.modifiers.control && (e.text == "u" || e.text == "U" || e.text == "\u{0015}")) {
+                            } else if (((root.is-macos && e.modifiers.meta) || (!root.is-macos && e.modifiers.control))
+                                    && (e.text == "u" || e.text == "U" || e.text == "\u{0015}")) {
                                 self.set-selection-offsets(0, self.cursor-position_byte-offset);
                                 self.cut();
                                 accept
