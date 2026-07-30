@@ -1,7 +1,7 @@
 # Cloudshell
 
 **简体中文** | [English](./README.en.md)
-
+[![OctoCounts](https://api.octocounts.com/badge/wanghua98/cloudshell/branch/master)](https://octocounts.com/github/wanghua98/cloudshell/tree/master)
 > 轻量、原生的跨平台 SSH、SFTP 与终端客户端。
 
 Cloudshell 使用 Rust 和 [Slint](https://slint.dev) 构建，将多标签终端、文件传输、隧道和远程主机监控整合到一个桌面应用中。它面向日常服务器运维、开发和网络设备管理，力求提供专业 SSH 客户端常用的工作流，同时保持原生应用的轻量体验。
