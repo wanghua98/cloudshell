@@ -832,13 +832,17 @@ async fn run_session(
                         let chunk = String::from_utf8_lossy(&data).into_owned();
 
                         // Inject PROMPT_COMMAND after the first real shell output.
-                        if shell_integration && !prompt_injected && !chunk.trim().is_empty() {
+                        let injected_prompt_hook = shell_integration
+                            && !prompt_injected
+                            && !chunk.trim().is_empty();
+                        if injected_prompt_hook {
                             prompt_injected = true;
                             suppress_echo = true;
                             suppress_started = Some(std::time::Instant::now());
                             let _ = channel.data(prompt_setup.as_bytes()).await;
-                            // Fall through: this chunk is buffered below so the
-                            // echoed setup line is stripped as a single piece.
+                            // The first prompt is already real terminal output:
+                            // show it now. Only later data can contain the hook
+                            // echo, and is eligible for suppression.
                         }
 
                         // While suppressing, buffer output until our echoed setup
@@ -852,7 +856,7 @@ async fn run_session(
                         // short, un-wrappable prefix of the injected command. A size
                         // cap is the safety valve for a shell that never reports back
                         // (e.g. dash without PROMPT_COMMAND).
-                        let mut text = if suppress_echo {
+                        let mut text = if suppress_echo && !injected_prompt_hook {
                             echo_buf.push_str(&chunk);
                             const ECHO_BUF_CAP: usize = 1 << 14; // 16 KiB
                             // The command echo + its trailing OSC 7 (the one after
