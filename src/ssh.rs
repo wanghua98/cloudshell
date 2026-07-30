@@ -86,9 +86,18 @@ const PROMPT_PREFIX: &str = "test -z \"$FISH_VERSION\"";
 /// never produces the OSC 7 marker used by the normal path.
 fn strip_prompt_setup_echo(mut text: String) -> String {
     if let Some(pos) = text.find(PROMPT_PREFIX) {
-        let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        if let Some(end) = text[pos..].find('\n') {
-            text.replace_range(start..pos + end + 1, "");
+        // A PTY normally echoes Enter as CR (and may later add LF). Looking
+        // only for LF let wrapped hook tails leak on servers that emit CR-only
+        // prompts.
+        let start = text[..pos].rfind(['\r', '\n']).map(|i| i + 1).unwrap_or(0);
+        if let Some(end) = text[pos..].find(['\r', '\n']) {
+            let mut line_end = pos + end + 1;
+            if text.as_bytes().get(line_end - 1) == Some(&b'\r')
+                && text.as_bytes().get(line_end) == Some(&b'\n')
+            {
+                line_end += 1;
+            }
+            text.replace_range(start..line_end, "");
         }
     }
     text
@@ -871,8 +880,10 @@ async fn run_session(
                                 tracing::debug!("OSC7 cwd={:?}", cwd);
                                 let _ = events.send(SessionEvent::CwdChanged(cwd));
                                 let mut buf = std::mem::take(&mut echo_buf);
-                                let line_start =
-                                    buf[..cmd_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                                let line_start = buf[..cmd_pos]
+                                    .rfind(['\r', '\n'])
+                                    .map(|i| i + 1)
+                                    .unwrap_or(0);
                                 buf.replace_range(line_start..osc_end, "");
                                 buf
                             } else if echo_buf.len() >= ECHO_BUF_CAP
@@ -1483,6 +1494,15 @@ mod osc_command_tests {
     fn timeout_fallback_removes_a_complete_hook_echo() {
         let text = "banner\r\n test -z \"$FISH_VERSION\" && eval ...\r\nprompt> ";
         assert_eq!(strip_prompt_setup_echo(text.into()), "banner\r\nprompt> ");
+    }
+
+    #[test]
+    fn timeout_fallback_removes_cr_terminated_hook_echo() {
+        let text = "banner\rtest -z \"$FISH_VERSION\" && eval ...\rroot@host:~# ";
+        assert_eq!(
+            strip_prompt_setup_echo(text.into()),
+            "banner\rroot@host:~# "
+        );
     }
 }
 
