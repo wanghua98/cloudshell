@@ -33,6 +33,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+/// Stable runtime-only ID for the built-in local terminal.
+///
+/// The local session is injected after loading and filtered before saving or
+/// exporting, so it is always available without polluting user configuration.
+pub const LOCAL_SESSION_ID: &str = "__cloudshell_local__";
+
 /// A secret string (e.g. a session password) whose heap buffer is zeroed when
 /// it is dropped, so plaintext credentials don't survive in freed memory and
 /// turn up in core dumps, a debugger, or `/proc/<pid>/mem`.  `Clone` makes an
@@ -86,6 +92,8 @@ impl<'de> Deserialize<'de> for Secret {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionKind {
+    /// A shell running on this computer inside a native pseudo-terminal.
+    Local,
     /// SSH shell + SFTP (the original and default behaviour).
     #[default]
     Ssh,
@@ -98,6 +106,7 @@ pub enum SessionKind {
 impl SessionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            SessionKind::Local => "local",
             SessionKind::Ssh => "ssh",
             SessionKind::Serial => "serial",
             SessionKind::Telnet => "telnet",
@@ -106,6 +115,7 @@ impl SessionKind {
 
     pub fn from_str(s: &str) -> Self {
         match s {
+            "local" => SessionKind::Local,
             "serial" => SessionKind::Serial,
             "telnet" => SessionKind::Telnet,
             _ => SessionKind::Ssh,
@@ -297,6 +307,25 @@ pub struct PortForward {
 }
 
 impl Session {
+    /// Construct the built-in local terminal. It is a runtime entry rather than
+    /// a user-owned saved connection; see [`LOCAL_SESSION_ID`].
+    pub fn local() -> Self {
+        let mut session = Self::new_empty();
+        session.id = LOCAL_SESSION_ID.to_string();
+        session.name = "Local".to_string();
+        session.host = "localhost".to_string();
+        session.user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "local".to_string());
+        session.kind = SessionKind::Local;
+        session.disable_shell_integration = true;
+        session
+    }
+
+    pub fn is_builtin_local(&self) -> bool {
+        self.id == LOCAL_SESSION_ID || self.kind == SessionKind::Local
+    }
+
     pub fn new_empty() -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -541,7 +570,7 @@ impl ConfigStore {
 
         let key = Self::load_or_create_key(&config_dir)?;
 
-        let cache = if path.exists() {
+        let mut cache = if path.exists() {
             let raw = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
             match serde_json::from_str::<ConfigFile>(&raw) {
@@ -572,6 +601,11 @@ impl ConfigStore {
             ConfigFile::default()
         };
 
+        // Local is a built-in capability, not persisted user data. Discard a
+        // stale/imported copy and inject one canonical entry on every launch.
+        cache.sessions.retain(|session| !session.is_builtin_local());
+        cache.sessions.insert(0, Session::local());
+
         Ok(Self { path, cache, key })
     }
 
@@ -591,6 +625,9 @@ impl ConfigStore {
     }
 
     pub fn upsert(&mut self, session: Session) {
+        if session.is_builtin_local() {
+            return;
+        }
         if let Some(existing) = self.cache.sessions.iter_mut().find(|s| s.id == session.id) {
             *existing = session;
         } else {
@@ -599,6 +636,9 @@ impl ConfigStore {
     }
 
     pub fn remove(&mut self, id: &str) {
+        if id == LOCAL_SESSION_ID {
+            return;
+        }
         self.cache.sessions.retain(|s| s.id != id);
     }
 
@@ -902,6 +942,7 @@ impl ConfigStore {
     pub fn save(&self) -> Result<()> {
         // Build a disk copy where every non-empty password is encrypted.
         let mut disk = self.cache.clone();
+        disk.sessions.retain(|session| !session.is_builtin_local());
         for session in &mut disk.sessions {
             if !session.password.is_empty()
                 && !session.password.as_str().starts_with(Self::ENC_PREFIX)
@@ -967,7 +1008,13 @@ impl ConfigStore {
     pub fn export_to(&self, path: &Path) -> Result<usize> {
         let mut out = ExportFile {
             cloudshell_export: 1,
-            sessions: self.cache.sessions.clone(),
+            sessions: self
+                .cache
+                .sessions
+                .iter()
+                .filter(|session| !session.is_builtin_local())
+                .cloned()
+                .collect(),
         };
         for s in &mut out.sessions {
             // `cache` holds plaintext passwords; obfuscate with the export key.
@@ -995,6 +1042,10 @@ impl ConfigStore {
         let mut added = 0usize;
         let mut skipped = 0usize;
         for mut s in file.sessions {
+            if s.is_builtin_local() {
+                skipped += 1;
+                continue;
+            }
             // Recover the plaintext password (cache stores plaintext). Accept an
             // export blob, our local enc:v1 blob, or a legacy plaintext value.
             if let Some(plain) = Self::decrypt_export(s.password.as_str()) {
@@ -1036,6 +1087,9 @@ mod tests {
     #[test]
     fn export_import_roundtrip_preserves_password() {
         let mut a = temp_store();
+        // The runtime-only built-in local terminal must never leak into a
+        // portable connection export.
+        a.cache.sessions.push(Session::local());
         a.cache.sessions.push(Session {
             name: "pve".into(),
             host: "192.168.100.2".into(),

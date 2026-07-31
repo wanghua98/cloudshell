@@ -101,7 +101,27 @@ if [[ "$with_windows" == true ]]; then
   windows_target="x86_64-pc-windows-gnu"
   windows_exe="$dist_dir/cloudshell-v${version}-windows-x86_64.exe"
   echo "==> Cross-building cloudshell v${version} for Windows"
-  cargo zigbuild --release --target "$windows_target"
+
+  # Zig opens the Rust objects concurrently during the final PE link. Give the
+  # linker a reasonable descriptor budget when this script was launched by an
+  # app or CI runner with macOS's low default soft limit.
+  fd_soft="$(ulimit -Sn)"
+  if [[ "$fd_soft" != "unlimited" ]] && (( fd_soft < 4096 )); then
+    fd_hard="$(ulimit -Hn)"
+    fd_target=4096
+    if [[ "$fd_hard" != "unlimited" ]] && (( fd_hard < fd_target )); then
+      fd_target="$fd_hard"
+    fi
+    if ! ulimit -Sn "$fd_target"; then
+      echo "Warning: could not raise the open-file limit above $fd_soft." >&2
+    fi
+  fi
+
+  # Thin LTO makes rustc hand Zig hundreds of individual dependency objects.
+  # Zig 0.16 can then fail with ProcessFdQuotaExceeded. Keep Thin LTO for the
+  # native macOS release, but disable it for this cross-link only.
+  CARGO_PROFILE_RELEASE_LTO=off \
+    cargo zigbuild --release --target "$windows_target"
   cp "target/$windows_target/release/cloudshell.exe" "$windows_exe"
   echo "Created Windows executable: $windows_exe"
 fi

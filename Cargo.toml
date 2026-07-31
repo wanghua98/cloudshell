@@ -1,6 +1,6 @@
 [package]
 name = "cloudshell"
-version = "0.0.5"
+version = "1.0.0"
 edition = "2021"
 authors = ["cloudshell contributors"]
 description = "A lightweight FinalShell-style SSH/terminal client written in Rust + Slint"
@@ -73,6 +73,10 @@ dark-light = "1"
 # in-app update check against the GitHub releases API (#48). Runs on a
 # background thread so it never blocks startup; failure is silently ignored.
 ureq = { version = "2", features = ["tls"] }
+# Native pseudo-terminal for the built-in Local session. This uses Unix PTYs
+# on macOS/Linux and ConPTY on Windows, so interactive programs behave exactly
+# like they do in a real terminal rather than through plain stdin/stdout pipes.
+portable-pty = "0.9"
 
 # Decode the embedded PNG icon to set the window icon at runtime (Linux only).
 # On Windows the icon comes from the .ico embedded by winresource at link time;

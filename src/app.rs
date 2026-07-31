@@ -165,7 +165,7 @@ pub fn run() -> Result<()> {
     // commands into history (#113).
     HISTORY_STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
 
-    // Per-tab SSH handles (shell only; lives on Slint thread via Rc).
+    // Per-tab terminal handles (SSH/local/serial/Telnet; Slint thread only).
     let handles: Rc<RefCell<HashMap<String, SessionHandle>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
@@ -516,6 +516,7 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let store = store.clone();
         let tabs_model = tabs_model.clone();
+        let sessions_model = sessions_model.clone();
         window.on_set_language(move |code| {
             crate::i18n::set_language(code.as_ref());
             {
@@ -532,6 +533,7 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
+            sync_sessions_to_model(&store.borrow(), &sessions_model);
             if let Some(w) = weak.upgrade() {
                 w.set_lang_en(crate::i18n::is_en());
                 w.invoke_refresh_sidebar();
@@ -891,6 +893,7 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let sh = sftp_handles.clone();
         let close_handles = handles.clone();
+        #[cfg(target_os = "macos")]
         let wheel_bufs = bufs.clone();
         let activity = window_activity.clone();
         let sampling_timer = timer.clone();
@@ -1241,7 +1244,9 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     //  - "default" only when there are ungrouped sessions (group == "")
     //  - named groups: explicit folders (incl. empty ones) ∪ sessions' groups,
     //    de-duplicated, alphabetical.
-    let has_default = sessions.iter().any(|s| s.group.is_empty());
+    let has_default = sessions
+        .iter()
+        .any(|s| s.kind != SessionKind::Local && s.group.is_empty());
     let mut named: Vec<String> = store
         .groups()
         .iter()
@@ -1249,7 +1254,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         .chain(
             sessions
                 .iter()
-                .filter(|s| !s.group.is_empty())
+                .filter(|s| s.kind != SessionKind::Local && !s.group.is_empty())
                 .map(|s| s.group.clone()),
         )
         .collect();
@@ -1271,18 +1276,41 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         port: 0,
         user: "".into(),
         auth: "".into(),
+        kind: "".into(),
         last_used: "".into(),
         group: group.into(),
         group_header: group.into(),
         collapsed: false,
     };
 
-    let mut rows: Vec<SessionInfo> = Vec::new();
+    let mut rows: Vec<SessionInfo> = sessions
+        .iter()
+        .filter(|session| session.kind == SessionKind::Local)
+        .map(|session| SessionInfo {
+            id: session.id.clone().into(),
+            name: t("本机", "Local").into(),
+            host: t("本地终端", "Local terminal").into(),
+            port: 0,
+            user: session.user.clone().into(),
+            auth: "".into(),
+            kind: session.kind.as_str().into(),
+            last_used: "".into(),
+            group: "__local__".into(),
+            group_header: "".into(),
+            collapsed: false,
+        })
+        .collect();
     for group in &display_groups {
         let mut gs: Vec<&Session> = if group == "default" {
-            sessions.iter().filter(|s| s.group.is_empty()).collect()
+            sessions
+                .iter()
+                .filter(|s| s.kind != SessionKind::Local && s.group.is_empty())
+                .collect()
         } else {
-            sessions.iter().filter(|s| &s.group == group).collect()
+            sessions
+                .iter()
+                .filter(|s| s.kind != SessionKind::Local && &s.group == group)
+                .collect()
         };
         gs.sort_by_key(|s| s.name.to_lowercase());
 
@@ -1297,6 +1325,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                     port: s.port as i32,
                     user: s.user.clone().into(),
                     auth: s.auth.as_str().into(),
+                    kind: s.kind.as_str().into(),
                     last_used: s
                         .last_used
                         .clone()
@@ -2165,17 +2194,22 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                 return;
             }
             let tab_id = format!("term-{}", uuid::Uuid::new_v4());
-            let tab_title = session.name.clone();
+            let tab_title = if session.kind == SessionKind::Local {
+                t("本机", "Local").to_string()
+            } else {
+                session.name.clone()
+            };
 
             // Connection label shown in the sidebar / status line, per transport.
             let conn_label = match session.kind {
+                SessionKind::Local => format!("{}@{}", session.user, t("本机", "local")),
                 SessionKind::Ssh => format!("{}@{}", session.user, session.host),
                 SessionKind::Serial => {
                     format!("{} @{}", session.serial_port, session.baud_rate)
                 }
                 SessionKind::Telnet => format!("telnet {}:{}", session.host, session.port),
             };
-            // Serial / Telnet have no SFTP side-channel.
+            // Only SSH has an SFTP side-channel.
             let has_sftp = session.kind == SessionKind::Ssh;
 
             // Seed the per-tab status so the sidebar shows "连接中 host" the
@@ -2187,6 +2221,7 @@ fn wire_session_callbacks(window: &AppWindow, ctx: &SessionCallbackCtx) {
                     host: conn_label.clone(),
                     session_id: id.clone(),
                     state: 0,
+                    is_local: session.kind == SessionKind::Local,
                     remote_tools: has_sftp,
                     ..Default::default()
                 },
@@ -2304,6 +2339,13 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     let has_sftp = session.kind == SessionKind::Ssh;
     let (initial_cols, initial_rows) = *ctx.last_term_size.lock().unwrap();
     let (handle, rx) = match session.kind {
+        SessionKind::Local => crate::local::spawn_local_session(
+            ctx.runtime.handle(),
+            tab_id.to_string(),
+            session.clone(),
+            initial_cols,
+            initial_rows,
+        ),
         SessionKind::Ssh => spawn_session(
             ctx.runtime.handle(),
             tab_id.to_string(),
@@ -2771,6 +2813,20 @@ fn refresh_sidebar(
     };
 
     match status {
+        // The built-in PTY is connected like any other terminal, but its
+        // resource sidebar must keep showing this machine rather than an empty
+        // remote-resource snapshot.
+        Some(st) if st.is_local => {
+            win.set_conn_state(st.state as i32);
+            let label = match st.state {
+                1 => st.host,
+                2 => format!("{} {}", st.host, t("已断开", "disconnected")),
+                _ => format!("{} {}", t("连接中", "Connecting"), st.host),
+            };
+            win.set_connection_state(label.into());
+            show_local_res(win);
+            set_top_local(win);
+        }
         // A live session tab → remote resources + remote NIC on top.
         Some(st) if st.state == 1 => {
             win.set_conn_state(1);

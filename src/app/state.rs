@@ -51,6 +51,8 @@ pub(crate) struct TabStatus {
     pub(crate) host: String,
     pub(crate) session_id: String,
     pub(crate) state: u8,
+    /// The built-in local PTY uses local resource samples, not remote stats.
+    pub(crate) is_local: bool,
     /// True for SSH sessions that can open auxiliary exec channels.
     pub(crate) remote_tools: bool,
     pub(crate) cpu: f32,
