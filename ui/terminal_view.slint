@@ -100,6 +100,9 @@ export component TerminalView inherits Rectangle {
     in property <[TermMatch]> find-matches; // search-highlight rectangles
     in property <[TermMatch]> selection;    // drag-selection highlight rectangles
 
+    // Local, serial and Telnet tabs are terminal-only: no empty SFTP toolbar,
+    // file tree, or resize separator should consume screen space.
+    in property <bool> has-sftp: true;
     in property <string>  sftp-path: "/";
     in property <[SftpEntry]> sftp-entries;
     in property <string>  sftp-status: "";
@@ -1314,7 +1317,7 @@ export component TerminalView inherits Rectangle {
         }
 
         // --- Drag handle ----------------------------------------------------
-        Rectangle {
+        if root.has-sftp : Rectangle {
             height: 4px;
             background: divider-ta.has-hover || root.sftp-dragging
                 ? Theme.accent
@@ -1346,7 +1349,7 @@ export component TerminalView inherits Rectangle {
         }
 
         // --- SFTP panel -----------------------------------------------------
-        SftpPanel {
+        if root.has-sftp : SftpPanel {
             height: root.sftp-panel-height;
             collapsed:     root.sftp-collapsed;
             current-path:  root.sftp-path;

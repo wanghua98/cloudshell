@@ -71,6 +71,7 @@ export struct TerminalState {
     selection: [TermMatch],    // drag-selection highlight rectangles
 
     // SFTP panel state
+    has-sftp: bool,             // false for local, serial and Telnet terminals
     sftp-path: string,
     sftp-entries: [SftpEntry],
     sftp-status: string,
@@ -743,6 +744,7 @@ export component AppWindow inherits Window {
                     is-alt-screen: term.is-alt-screen;
                     find-matches: term.find-matches;
                     selection: term.selection;
+                    has-sftp: term.has-sftp;
                     sftp-panel-height <=> root.sftp-panel-height;
                     sftp-collapsed <=> root.sftp-collapsed;
                     sftp-saved-height <=> root.sftp-saved-height;

@@ -1,6 +1,7 @@
 # Cloudshell
 
 **简体中文** | [English](./README.en.md)
+
 [![OctoCounts](https://api.octocounts.com/badge/wanghua98/cloudshell/branch/master)](https://octocounts.com/github/wanghua98/cloudshell/tree/master)
 > 轻量、原生的跨平台 SSH、SFTP 与终端客户端。
 
